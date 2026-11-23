@@ -250,6 +250,33 @@ def _cues(words: List[Dict[str, Any]], max_chars: int = 32, max_words: int = 6,
     return cues
 
 
+def _merge_short_cues(cues: List[List[Dict[str, Any]]], clip_len: float,
+                      max_chars: int, max_words: int) -> List[List[Dict[str, Any]]]:
+    """Объединяет слишком короткие реплики, если вместе они помещаются в кадр."""
+    merged: List[List[Dict[str, Any]]] = []
+
+    def fits(left: List[Dict[str, Any]], right: List[Dict[str, Any]]) -> bool:
+        return (len(left) + len(right) <= max_words
+                and len(" ".join(word["word"] for word in left + right)) <= max_chars)
+
+    for cue in cues:
+        if merged:
+            previous = merged[-1]
+            available = cue[0]["start"] - previous[0]["start"]
+            same_frame = round(cue[0]["start"] * 100) == round(previous[0]["start"] * 100)
+            if same_frame or (available < 0.35 and fits(previous, cue)):
+                previous.extend(cue)
+                continue
+        merged.append(list(cue))
+    if len(merged) > 1:
+        previous, last = merged[-2:]
+        if (clip_len - last[0]["start"] < 0.35
+                and last[0]["start"] - previous[-1]["end"] < 0.35
+                and fits(previous, last)):
+            previous.extend(merged.pop())
+    return merged
+
+
 def _pos_tag(position: str, offset: int) -> str:
     """Возвращает override-тег положения. offset > 0 — выше/дальше от края."""
     if position == "top":
@@ -273,10 +300,10 @@ def to_srt(words: List[Dict[str, Any]], start: float, end: float,
            max_words: int = 6) -> str:
     """SRT для тех, кто монтирует сам: слова собираются в короткие реплики."""
     def stamp(seconds: float) -> str:
-        seconds = max(0.0, float(seconds) - start)
-        hours, rest = divmod(int(seconds), 3600)
+        total = max(0, round((float(seconds) - start) * 1000))
+        seconds, millis = divmod(total, 1000)
+        hours, rest = divmod(seconds, 3600)
         minutes, secs = divmod(rest, 60)
-        millis = int(round((seconds - int(seconds)) * 1000))
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
     cues: List[List[Dict[str, Any]]] = []
@@ -386,6 +413,8 @@ def build_ass(words: List[Dict[str, Any]], clip_start: float, clip_end: float,
 
     local = []
     for w in words:
+        if float(w["end"]) <= clip_start:
+            continue
         s = max(0.0, float(w["start"]) - clip_start)
         e = max(s + 0.05, float(w["end"]) - clip_start)
         if s >= clip_len:
@@ -395,16 +424,11 @@ def build_ass(words: List[Dict[str, Any]], clip_start: float, clip_end: float,
             continue
         if uppercase:
             token = token.upper()
-        local.append({"word": token, "start": s, "end": min(e, clip_len)})
+        # На точности ASS последнему слову нужна хотя бы одна сотая секунды.
+        local.append({"word": token, "start": min(s, round(clip_len, 2) - 0.01),
+                      "end": min(e, clip_len)})
 
-    # Whisper иногда даёт одинаковые/пересекающиеся тайминги слов — выравниваем,
-    # иначе несколько реплик рисуются одновременно и текст накладывается.
     local.sort(key=lambda item: item["start"])
-    cursor = 0.0
-    for item in local:
-        item["start"] = max(item["start"], cursor)
-        item["end"] = max(item["end"], item["start"] + 0.08)
-        cursor = item["end"]
 
     if show_hook and hook.strip():
         hook_text = _clean(hook).upper() if uppercase else _clean(hook)
@@ -424,25 +448,16 @@ def build_ass(words: List[Dict[str, Any]], clip_start: float, clip_end: float,
     # Короткие реплики + караоке-подсветка: текст не «мигает» на каждом слове,
     # а плавно закрашивается цветом акцента и висит ещё немного после речи.
     cue_chars = max(12, min(int(chars * 2 - 2), int(preset["max_chars"])))
-    cues = _cues(local, max_chars=cue_chars, max_words=int(preset["max_words"]),
-                 max_gap=float(preset["max_gap"]))
-
-    timed: List[Any] = []
-    for index, cue in enumerate(cues):
-        if not cue:
-            continue
-        start = max(0.0, float(cue[0]["start"]))
-        end = min(clip_len, max(float(cue[-1]["end"]) + float(preset["hold"]),
-                                start + float(preset["min_cue"])))
-        if index + 1 < len(cues) and cues[index + 1]:
-            nxt = max(start + 0.3, float(cues[index + 1][0]["start"]) - 0.02)
-            end = min(end, nxt)
-        timed.append((cue, start, end))
-
+    max_words = int(preset["max_words"])
+    cues = _cues(local, max_chars=cue_chars, max_words=max_words, max_gap=float(preset["max_gap"]))
+    cues = _merge_short_cues(cues, clip_len, cue_chars, max_words)
     fade_in, fade_out = preset["fade"]
-    for cue, cue_start, cue_end in timed:
-        if cue_end - cue_start < 0.35:
-            continue
+    for index, cue in enumerate(cues):
+        cue_start = cue[0]["start"]
+        spoken_end = max(word["end"] for word in cue)
+        next_start = cues[index + 1][0]["start"] if index + 1 < len(cues) else clip_len
+        cue_end = min(next_start, max(spoken_end + float(preset["hold"]),
+                                     cue_start + float(preset["min_cue"])))
         tokens = [w["word"] for w in cue]
         # перенос строк: 1–2 строки, сбалансированные по ширине
         line_groups = [[i for i in range(len(tokens))]]
@@ -463,9 +478,8 @@ def build_ass(words: List[Dict[str, Any]], clip_start: float, clip_end: float,
         # длительности \k: каждое слово подсвечивается ровно в свой момент
         karaoke: List[int] = []
         for wi, word in enumerate(cue):
-            nxt = float(cue[wi + 1]["start"]) if wi + 1 < len(cue) else float(cue_end)
-            duration = max(0.03, nxt - float(word["start"]))
-            karaoke.append(max(1, int(round(duration * 100))))
+            nxt = cue[wi + 1]["start"] if wi + 1 < len(cue) else cue_end
+            karaoke.append(max(0, round(min(nxt, cue_end) * 100) - round(word["start"] * 100)))
 
         rendered: List[str] = []
         for group in line_groups:
@@ -473,7 +487,8 @@ def build_ass(words: List[Dict[str, Any]], clip_start: float, clip_end: float,
                 f"{{\\k{karaoke[ti]}}}{tokens[ti]}" for ti in group
             ))
         body = "\\N".join(rendered)
-        tags = (f"\\fad({int(fade_in)},{int(fade_out)})"
+        fade_limit = max(0, round((cue_end - cue_start) * 200))
+        tags = (f"\\fad({min(fade_in, fade_limit)},{min(fade_out, fade_limit)})"
                 f"\\fscx104\\fscy104\\t(0,170,\\fscx100\\fscy100)")
         events.append(
             f"Dialogue: 0,{ass_time(cue_start)},{ass_time(cue_end)},Sub,,0,0,0,,"

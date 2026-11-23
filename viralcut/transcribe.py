@@ -60,6 +60,10 @@ class TranscriptionError(Exception):
     pass
 
 
+class NoSpeechError(TranscriptionError):
+    pass
+
+
 def model_cached() -> bool:
     """Модель уже есть локально (внутри .app или в кэше — сеть не нужна)."""
     if WHISPER_LOCAL_DIR and (Path(WHISPER_LOCAL_DIR) / "model.bin").is_file():
@@ -377,7 +381,8 @@ def _split_audio(wav: Path, workdir: Path, chunk_seconds: int) -> tuple[List[tup
 
 
 def transcribe(media: Path, workdir: Path, language: Optional[str] = None,
-               on_progress: ProgressCb = None) -> Dict[str, Any]:
+               on_progress: ProgressCb = None, *, audio_track: Optional[int] = None,
+               window: Optional[tuple[float, float]] = None) -> Dict[str, Any]:
     started = time.time()
     if on_progress:
         on_progress(0.005, "Подготовка звука для распознавания…")
@@ -386,13 +391,14 @@ def transcribe(media: Path, workdir: Path, language: Optional[str] = None,
     except utils.MediaError:
         info = {"duration": utils.media_duration(media), "has_audio": True,
                 "width": 0, "height": 0}
-    duration = info["duration"]
+    duration = window[1] - window[0] if window is not None else info["duration"]
 
     if not info["has_audio"]:
         raise TranscriptionError("В видео нет аудиодорожки — нарезки с субтитрами невозможны.")
 
     # Чистим звук: убираем низкочастотный гул и шипение, выравниваем громкость.
-    wav = utils.extract_asr_audio(media, workdir / "audio16k.wav")
+    wav = utils.extract_asr_audio(media, workdir / "audio16k.wav",
+                                  audio_track=audio_track, window=window)
     chunk_seconds = max(120, int(os.environ.get("VIRALCUT_WHISPER_CHUNK", "600")))
     trigger = max(chunk_seconds, int(os.environ.get("VIRALCUT_WHISPER_CHUNK_MIN", "1800")))
     long_audio = duration > trigger
@@ -444,7 +450,7 @@ def transcribe(media: Path, workdir: Path, language: Optional[str] = None,
     if chunks_folder is not None:
         shutil.rmtree(chunks_folder, ignore_errors=True)
     if not out:
-        raise TranscriptionError("Речь не распознана: возможно, в видео нет голоса.")
+        raise NoSpeechError("Речь не распознана: возможно, в видео нет голоса.")
 
     # Второй проход по спорным местам — только когда аудио не разрезано на части.
     fixed = 0

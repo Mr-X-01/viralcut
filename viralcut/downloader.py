@@ -250,8 +250,9 @@ def _attempt(url: str, dest_dir: Path, fmt: str, clients: Optional[List[str]],
     if pot and os.environ.get("VIRALCUT_POT_URL"):
         opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
             "base_url": [os.environ["VIRALCUT_POT_URL"]]}
-        if os.environ.get("VIRALCUT_NODE"):
-            opts["js_runtimes"] = {"node": {"path": os.environ["VIRALCUT_NODE"]}}
+    node = os.environ.get("VIRALCUT_NODE")
+    if node and is_youtube(url):
+        opts["js_runtimes"] = {"node": {"path": node}}
     opts.update(_cookie_opts(browser))
     ytdlp_ffmpeg(opts)
 
@@ -351,12 +352,15 @@ def _youtube_candidates(pot: bool) -> List[tuple[str, Dict[str, Any]]]:
 
 
 def _youtube_info(url: str, browser: Optional[str], pot: bool,
-                  progress: ProgressCb = None) -> tuple[Dict[str, Any], Dict[str, Any], str]:
-    """Метаданные от первого набора клиентов, который отдал форматы."""
+                  progress: ProgressCb = None, *,
+                  preferred_height: int = 1080) -> tuple[Dict[str, Any], Dict[str, Any], str]:
+    """При доступном провайдере проверяет нужное качество и сохраняет запасной вариант."""
     import yt_dlp
 
     ensure_path()
     errors: List[str] = []
+    best: Optional[tuple[Dict[str, Any], Dict[str, Any], str]] = None
+    best_height = 0
     for label, args in _youtube_candidates(pot):
         opts: Dict[str, Any] = {
             "quiet": True, "no_warnings": True, "skip_download": True,
@@ -383,14 +387,19 @@ def _youtube_info(url: str, browser: Optional[str], pot: bool,
         if "entries" in info:
             entries = [e for e in info["entries"] if e]
             info = entries[0] if entries else info
-        formats = info.get("formats") or []
-        if not formats:
-            errors.append(f"{label}: нет форматов")
+        _, height = _pick_format(info, preferred_height)
+        if not height:
+            errors.append(f"{label}: нет видеодорожек")
             continue
+        print(f"[youtube] клиент «{label}»: {height}p", file=sys.stderr)
+        if height > best_height:
+            best, best_height = (info, args, label), height
+        if not pot or height >= preferred_height:
+            break
+    if best is not None:
         if progress:
-            progress(0.02, f"Источник ответил ({label})")
-        print(f"[youtube] клиент «{label}»: {len(formats)} форматов", file=sys.stderr)
-        return info, args, label
+            progress(0.02, f"Источник ответил ({best[2]})")
+        return best
     detail = " | ".join(errors[-2:])
     raise DownloadError("YouTube не отдал видео ни одному клиенту. " + detail[-350:])
 
@@ -410,10 +419,10 @@ def _pick_format(info: Dict[str, Any], max_height: int) -> tuple[str, int]:
     def rank(f: Dict[str, Any]) -> tuple:
         codec = f.get("vcodec") or ""
         return (
+            int(f.get("height") or 0),
             1 if codec.startswith("avc1") else 0,
             1 if f.get("ext") == "mp4" else 0,
             1 if (f.get("acodec") or "none") != "none" else 0,
-            int(f.get("height") or 0),
         )
 
     video = max(fitting, key=rank)
@@ -462,7 +471,7 @@ def download(url: str, dest_dir: Path, progress: ProgressCb = None,
         # Сначала спрашиваем форматы у нескольких клиентов и качаем выбранным.
         picked = None
         try:
-            info, args, client_label = _youtube_info(url, browser, pot, progress)
+            info, args, client_label = _youtube_info(url, browser, pot, progress, preferred_height=max_height)
             picked = (_pick_format(info, max_height), args, client_label)
         except DownloadError as exc:
             print(f"[youtube] метаданные не получены: {exc}", file=sys.stderr)

@@ -76,6 +76,7 @@ class StreamIn(BaseModel):
 class ClipEdit(BaseModel):
     sub_free: Optional[List[float]] = None
     text: Optional[str] = None
+    audio_track: Optional[int] = Field(None, ge=0)
     start: Optional[float] = None
     end: Optional[float] = None
     hook: Optional[str] = None
@@ -262,6 +263,9 @@ def project_audio_set(pid: str, body: Dict[str, Any]) -> Dict[str, Any]:
         track = max(0, int(body.get("index") or 0))
     except (TypeError, ValueError):
         raise HTTPException(400, "Неверная дорожка") from None
+    source = project.get("source")
+    if not source or track >= len(utils.audio_tracks(Path(source))):
+        raise HTTPException(400, "Выбранная аудиодорожка отсутствует в исходнике")
     options = dict(project.get("options") or {})
     options["audio_track"] = track
     db.update_project(pid, options=options)
@@ -337,8 +341,10 @@ def settings_set(body: SettingsIn) -> Dict[str, Any]:
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
     data = app_settings.update(patch)
     # выбор энкодера применяем сразу: кэш пробного кадра сбрасываем
-    render._HW_CACHE.clear()
+    render.reset_hw_encoder()
     data["hw_available"] = render.hw_encoder()
+    if sys.platform == "win32" and data["encoder"] == "gpu" and not data["hw_available"]:
+        data["encoder_warning"] = "Аппаратный кодировщик недоступен. Клипы будут кодироваться на процессоре."
     return data
 
 
@@ -347,7 +353,11 @@ def system_state() -> Dict[str, Any]:
     """Нагрузка машины для виджета: CPU, память, видеокарта."""
     from . import system_stats
 
-    data = system_stats.snapshot({"hw": render.hw_encoder(), "limits": resources.summary()})
+    data = system_stats.snapshot({
+        "hw": render.hw_cached(),
+        "limits": resources.summary(),
+        "encoder_fallback": render.cpu_fallback_notice(),
+    })
     data["job"] = system_stats.active_job(db.list_projects(5))
     return data
 
@@ -786,9 +796,10 @@ def clip_srt(cid: str) -> Response:
     clip = db.get_clip(cid)
     if not clip:
         raise HTTPException(404, "Клип не найден")
-    from . import subtitles
-
-    body = subtitles.to_srt(clip.get("words") or [], float(clip["start"]), float(clip["end"]))
+    try:
+        body = pipeline.clip_srt(clip)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not body.strip():
         raise HTTPException(400, "В клипе нет субтитров")
     title = (clip.get("title") or "clip").replace("/", " ").replace('"', "").strip()[:60] or "clip"
@@ -829,7 +840,8 @@ def clip_rerender(cid: str, body: ClipEdit) -> Dict[str, Any]:
         if body.end and recorded and body.end > recorded + 0.5:
             raise HTTPException(400, "Конец клипа выходит за пределы записанной части эфира")
     payload = _clean_clip_edit(body)
-    jobs.submit_rerender(cid, payload)
+    if not jobs.submit_rerender(cid, payload):
+        raise HTTPException(409, "Клип уже пересобирается")
     return {"ok": True, "clip": db.get_clip(cid)}
 
 

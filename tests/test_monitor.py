@@ -1,8 +1,10 @@
 """Мониторинг нагрузки не должен запускать процессы (иначе на Windows мигают окна)."""
 from __future__ import annotations
 
+import ctypes
 import subprocess
 import unittest
+from ctypes import wintypes
 from unittest import mock
 
 from viralcut import system_stats as ss
@@ -72,17 +74,18 @@ class WindowsNoSpawnTest(unittest.TestCase):
 
 
 class EngineSummaryTest(unittest.TestCase):
-    """Счётчики «GPU Engine»: суммируем 3D по адаптеру, берём самый занятый."""
+    """Суммируем процессы на одном движке, затем берём самый занятый."""
 
-    def test_sums_3d_per_adapter_and_ignores_other_engines(self):
+    def test_sums_per_engine_without_combining_engines_or_adapters(self):
         summary = ss._summarize_engine_utilization([
             (engine_path(pid=1, luid="0x0AAA"), 30.0),
-            (engine_path(pid=2, luid="0x0AAA"), 25.0),      # тот же адаптер
-            (engine_path(pid=1, luid="0x0AAA", eng=1, kind="VideoDecode"), 95.0),
-            (engine_path(pid=1, luid="0x0BBB"), 12.0),      # второй адаптер
-            (engine_path(pid=1, luid="0x0BBB", kind="Copy"), 88.0),
+            (engine_path(pid=2, luid="0x0AAA"), 25.0),
+            (engine_path(pid=1, luid="0x0AAA", eng=1, kind="VideoEncode"), 68.0),
+            (engine_path(pid=2, luid="0x0AAA", eng=1, kind="VideoEncode"), 12.0),
+            (engine_path(pid=1, luid="0x0AAA", eng=2), 31.0),
+            (engine_path(pid=1, luid="0x0BBB", kind="Copy"), 70.0),
         ])
-        self.assertEqual(summary["percent"], 55)
+        self.assertEqual(summary["percent"], 80)
         self.assertEqual(summary["adapters"], 2)
 
     def test_caps_at_100(self):
@@ -95,7 +98,11 @@ class EngineSummaryTest(unittest.TestCase):
     def test_empty_means_no_data(self):
         self.assertIsNone(ss._summarize_engine_utilization([])["percent"])
         self.assertIsNone(ss._summarize_engine_utilization(
-            [(engine_path(kind="Copy"), 30.0)])["percent"])
+            [(engine_path(kind="Copy"), float("nan"))])["percent"])
+
+    def test_zero_is_a_valid_idle_sample(self):
+        self.assertEqual(ss._summarize_engine_utilization(
+            [(engine_path(kind="VideoEncode"), 0.0)])["percent"], 0)
 
 
 class VendorTest(unittest.TestCase):
@@ -173,6 +180,37 @@ class PdhSafetyTest(unittest.TestCase):
     def test_pdh_returns_no_data_without_dll(self):
         with mock.patch.object(ss, "_pdh", return_value=None):
             self.assertIsNone(ss._gpu_windows_pdh().get("percent"))
+
+    def test_windows_pdh_reads_video_encode_instances(self):
+        pdh = mock.Mock()
+        pdh.PdhOpenQueryW.return_value = 0
+        pdh.PdhAddEnglishCounterW.return_value = 0
+        pdh.PdhCollectQueryData.return_value = 0
+        pdh.PdhCloseQuery.return_value = 0
+
+        def format_array(_counter, _format, size, count, array):
+            item = ss._PDH_VALUE[0]
+            if array is None:
+                ctypes.cast(size, ctypes.POINTER(wintypes.DWORD)).contents.value = 3 * ctypes.sizeof(item)
+                return ctypes.c_int32(0x800007D2).value
+            ctypes.cast(count, ctypes.POINTER(wintypes.DWORD)).contents.value = 3
+            for index, (kind, value, status) in enumerate(
+                [("3D", 0, 0), ("VideoEncode", 72, 1), ("VideoDecode", 99, 3)]
+            ):
+                array[index].szName = engine_path(eng=index, kind=kind)
+                array[index].FmtValue.doubleValue = value
+                array[index].FmtValue.CStatus = status
+            return 0
+
+        pdh.PdhGetFormattedCounterArrayW.side_effect = format_array
+        with mock.patch.object(ss, "_PDH_DLL", [None]), mock.patch.object(ss, "_PDH_VALUE", [None]), \
+             mock.patch.object(ss.ctypes, "WinDLL", return_value=pdh, create=True), \
+             mock.patch.object(ss.time, "sleep"):
+            self.assertEqual(ss._gpu_windows_pdh()["percent"], 72)
+        self.assertEqual(pdh.PdhCollectQueryData.call_count, 2)
+        self.assertEqual(pdh.PdhAddEnglishCounterW.call_args.args[1],
+                         r"\GPU Engine(*)\Utilization Percentage")
+        pdh.PdhCloseQuery.assert_called_once()
 
     def test_pdh_dll_cached_after_failure(self):
         ss._PDH_DLL[0] = None

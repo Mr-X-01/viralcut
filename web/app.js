@@ -232,6 +232,7 @@ const state = {
   pollTimer: null,
   mainKey: "",
   health: null,
+  encoderFallbackId: null,
   bootDone: false,
   probeOpen: false,
   probeUrl: "",
@@ -297,8 +298,8 @@ function renderSidebar() {
     const when = new Date((p.created_at || 0) * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
     const sub = p.status === "done" ? `${p.meta?.clips || ""} клипов · ${when}` : p.status === "error" ? "ошибка" : p.status === "running" ? "обработка…" : when;
     return `<button class="project-item ${state.current === p.id ? "active" : ""}" data-project="${p.id}">
-      <span class="status-dot ${esc(p.status)}"></span>
-      <span style="min-width:0">
+      <span class="project-item-icon">${p.meta?.live ? ICONS.play : OPT_ICONS.frame}<span class="status-dot ${esc(p.status)}"></span></span>
+      <span class="project-item-text">
         <span class="p-title">${esc(p.title || p.url)}</span>
         <span class="p-meta">${esc(sub)}</span>
       </span>
@@ -322,24 +323,49 @@ function heroHTML() {
   const o = state.opts;
   const counts = [5, 10, 20, 30, 50, 0];
   return `
-  <section class="hero">
-    <div class="eyebrow">${ICONS.spark} Автонарезка для Shorts · Reels · TikTok</div>
-    <h1 class="hero-title">Одно видео —<br><span class="grad">десятки вирусных клипов</span></h1>
-    <p class="hero-sub">Вставьте ссылку на YouTube, Twitch, TikTok, Instagram, VK или файл. Приложение найдёт самые цепляющие моменты, обрежет их в вертикаль с умным кадрированием по лицу, наложит субтитры с подсветкой слов и отрендерит готовые ролики.</p>
 
-    <button class="btn-ghost" id="discoverBtn">Найти видео на YouTube</button>
-    <div class="url-box">
-      <input id="urlInput" type="text" placeholder="https://youtube.com/watch?v=… или https://twitch.tv/videos/…" autocomplete="off" spellcheck="false" />
-      <button class="btn-primary" id="startBtn">Сделать нарезки</button>
+  <section class="hero hero-home">
+    <div class="hero-intro">
+      <div>
+        <div class="eyebrow">${ICONS.spark} Автонарезка для Shorts · Reels · TikTok</div>
+        <h1 class="hero-title">Одно видео —<br><span class="grad">десятки вирусных клипов</span></h1>
+        <p class="hero-sub">Добавьте ссылку или видеофайл. ViralCut найдёт яркие моменты, кадрирует их под нужный формат и наложит субтитры.</p>
+      </div>
+      <figure class="hero-visual" aria-label="Пример кадрирования в вертикальный клип">
+        <div class="hero-comparison">
+          <div>
+            <div class="hero-source-frame">
+              <img src="/static/examples/podcast.webp" alt="">
+              <span class="hero-crop-guide"></span>
+            </div>
+            <div class="hero-frame-label"><b>Исходное видео</b><span>16:9</span></div>
+          </div>
+          <span class="hero-arrow" aria-hidden="true">→</span>
+          <div>
+            <div class="hero-clip-frame">
+              <img src="/static/examples/podcast.webp" alt="">
+              <span class="hero-example-caption">С ЧЕГО НАЧАТЬ<br><em>ПЕРВЫЙ</em> ПРОЕКТ?</span>
+            </div>
+            <div class="hero-frame-label"><b>Клип</b><span>9:16</span></div>
+          </div>
+        </div>
+      </figure>
     </div>
-    <div class="upload-row">
-      <span>или</span>
-      <button class="link-btn" id="uploadBtn">загрузите видеофайлом</button>
-      <span>· mp4, mov, webm · длинные подкасты и интервью</span>
+    <div class="source-panel">
+      <button class="btn-ghost" id="discoverBtn">Найти видео на YouTube</button>
+      <label for="urlInput">Ссылка на видео</label>
+      <div class="url-box">
+        <input id="urlInput" type="text" placeholder="https://youtube.com/watch?v=…" autocomplete="off" spellcheck="false" />
+        <button class="btn-primary" id="startBtn">Сделать нарезки</button>
+      </div>
+      <div class="upload-row">
+        <button class="link-btn" id="uploadBtn">Загрузить видеофайл</button>
+        <span>MP4, MOV, WEBM</span>
+        <span class="source-services">YouTube, Twitch, TikTok, Instagram, VK</span>
+      </div>
+      <div class="hero-note">Для Twitch укажите ссылку на запись или клип. Идущая трансляция открывается на вкладке «Прямой эфир».</div>
     </div>
-    <div class="hero-note">Twitch: VOD или клип. Прямой эфир — на вкладке «Прямой эфир» слева.</div>
-
-    <div class="group-title"><span>Параметры нарезки</span><span class="group-hint">всё можно поменять позже</span></div>
+    <div class="group-title"><span>Параметры нарезки</span><span class="group-hint">Можно поменять позже</span></div>
     <div class="options">
       <div class="opt">
         ${optIcon("count", "ico-purple")}
@@ -358,9 +384,6 @@ function heroHTML() {
       <div class="opt">
         ${optIcon("aspect", "ico-cyan")}
         <span class="opt-label">Формат</span>
-        <div class="seg" data-group="language" style="margin-bottom:10px">
-          ${[["auto","Авто"],["ru","Русский"],["en","English"]].map(([v,l]) => `<button data-val="${v}" class="${(o.language||"auto") === v ? "active" : ""}">${l}</button>`).join("")}
-        </div>
         <div class="seg" data-group="aspect">
           ${["9:16", "1:1", "16:9", "4:5"].map((a) => `<button data-val="${a}" class="${o.aspect === a ? "active" : ""}">${a}</button>`).join("")}
         </div>
@@ -389,11 +412,28 @@ function heroHTML() {
         <span class="opt-label">Паузы</span>
         <div class="opt-control">
           <label class="toggle"><input type="checkbox" id="cutPausesToggle" ${o.cutPauses ? "checked" : ""}/><span class="track"></span><span>Вырезать паузы</span></label>
-          <span class="opt-hint">тишина и «эээ» убираются склейкой</span>
         </div>
       </div>
+      <div class="opt">
+        ${optIcon("subs", "ico-blue")}
+        <span class="opt-label">Язык видео</span>
+        <div class="seg" data-group="language">
+          ${[["auto","Авто"],["ru","Русский"],["en","English"]].map(([v,l]) => `<button data-val="${v}" class="${(o.language || "auto") === v ? "active" : ""}">${l}</button>`).join("")}
+        </div>
+      </div>
+      <div class="opt">
+        ${optIcon("access", "ico-gray")}
+        <span class="opt-label">Доступ к источнику</span>
+        <select id="cookiesSelect" aria-label="Доступ к источнику">
+          <option value="" ${o.cookies === "" ? "selected" : ""}>Без cookies</option>
+          <option value="chrome" ${o.cookies === "chrome" ? "selected" : ""}>Cookies из Chrome</option>
+          <option value="safari" ${o.cookies === "safari" ? "selected" : ""}>Cookies из Safari</option>
+          <option value="firefox" ${o.cookies === "firefox" ? "selected" : ""}>Cookies из Firefox</option>
+          <option value="edge" ${o.cookies === "edge" ? "selected" : ""}>Cookies из Edge</option>
+        </select>
+      </div>
       <div class="opt wide">
-        <span class="opt-head">${optIcon("style", "ico-pink")}<span class="opt-label">Стиль субтитров</span></span>
+        <div class="opt-head">${optIcon("style", "ico-pink")}<span class="opt-label">Стиль субтитров</span></div>
         <div class="substyle">
           <label class="mini-field">
             <span>Шрифт</span>
@@ -427,28 +467,8 @@ function heroHTML() {
           <div class="font-sample" id="fontSample" style="font-family:${FONT_CSS[o.subFont] || "VCMontserrat"}">ПРИМЕР СУБТИТРОВ</div>
         </div>
       </div>
-      <div class="composition-inline" id="compositionSettings"></div>
-      <div class="opt">
-        ${optIcon("access", "ico-gray")}
-        <span class="opt-label">Доступ к источнику</span>
-        <select id="cookiesSelect">
-          <option value="">Без cookies</option>
-          <option value="chrome">Cookies из Chrome</option>
-          <option value="safari">Cookies из Safari</option>
-          <option value="firefox">Cookies из Firefox</option>
-          <option value="edge">Cookies из Edge</option>
-        </select>
-      </div>
+      <div class="composition-inline wide" id="compositionSettings"></div>
     </div>
-
-    <a class="tg-hero" href="https://t.me/ivanAI22" data-external="https://t.me/ivanAI22" target="_blank" rel="noopener">
-      <span class="tg-ico">
-        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21.7 3.4 2.9 11.2c-.9.3-.9 1.5 0 1.8l4.6 1.6 1.7 5.4c.2.7 1.1.9 1.6.3l2.4-2.6 4.5 3.3c.6.4 1.5.1 1.7-.6l3-15.2c.2-.9-.7-1.6-1.5-1.3zM9.4 14.1l8.6-5.5-6.8 7-.2 3.1-1.6-4.6z"/></svg>
-      </span>
-      <span>Обновления и примеры клипов — в Telegram</span>
-      <b>@ivanAI22</b>
-      <span class="tg-arrow">↗</span>
-    </a>
   </section>`;
 }
 
@@ -720,6 +740,14 @@ async function loadDetail(force) {
   if (!state.current) return;
   try {
     const detail = await api(`/api/projects/${state.current}`);
+    if (state.detail?.project.id === detail.project.id) {
+      const previous = new Map(state.detail.clips.map((clip) => [clip.id, clip]));
+      for (const clip of detail.clips) {
+        if (clip.status === "ready" && clip.error && clip.error !== previous.get(clip.id)?.error) {
+          toast(`Пересборка не удалась. Готовый MP4 доступен. ${clip.error}`, "err");
+        }
+      }
+    }
     state.detail = detail;
     const item = state.projects.find((p) => p.id === detail.project.id);
     if (item) {
@@ -883,7 +911,8 @@ function clipsGridHTML() {
     const url = `/media/${p}/clips/clip_${String(c.idx + 1).padStart(2, "0")}.mp4?v=${Math.round(c.updated_at || 0)}`;
     const preview = c.has_preview ? `/media/${p}/previews/${c.id}.mp4?v=${Math.round(c.updated_at || 0)}` : url;
     const thumb = c.thumb ? `/media/${p}/thumbs/${c.id}.jpg?v=${Math.round(c.updated_at || 0)}` : "";
-    const wide = (c.settings?.aspect || "9:16") === "16:9" ? " wide" : (c.settings?.aspect || "") === "1:1" ? " square" : "";
+    const aspect = c.settings?.aspect || "9:16";
+    const wide = { "16:9": " wide", "1:1": " square", "4:5": " four-five" }[aspect] || "";
     const sp = c.settings?.score_parts || null;
     const partsLine = sp ? [
       ["хук", sp.hook], ["подача", sp.retention], ["эмоции", sp.emotion],
@@ -906,18 +935,15 @@ function clipsGridHTML() {
       </div>`;
     }
     return `<div class="clip-card${wide}" data-clip="${c.id}">
-      <div class="clip-media" data-action="edit">
+      <div class="clip-media" data-action="edit"${thumb ? ` style="--clip-poster:url('${esc(thumb)}')"` : ""}>
         <video src="${preview}#t=0.1" ${thumb ? `poster="${thumb}"` : ""} muted loop playsinline preload="metadata"></video>
-        <div class="play-hint">${ICONS.play}</div>
+        <button type="button" class="play-hint" aria-label="Открыть клип">${ICONS.play}</button>
         <div class="score-badge ${score >= 70 ? "hot" : ""}" title="Оценка момента по структуре речи, а не прогноз просмотров">⚡ ${score}</div>
         <div class="dur-badge">${fmtDur(dur)}</div>
-        <div class="clip-quick">
-          <button class="glass-btn" data-action="copy" title="Копировать подпись">${ICONS.copy}</button>
-          ${c.settings && c.settings.segments ? "" : `<button class="glass-btn" data-action="edit" title="Редактировать">${ICONS.edit}</button>`}
-        </div>
       </div>
       <div class="clip-body">
         <div class="clip-title">${esc(c.title || "Без названия")}</div>
+        <div class="clip-time">${fmtDur(c.start)} – ${fmtDur(c.end)}</div>
         ${partsLine ? `<div class="clip-parts">${partsLine}</div>` : ""}
         ${c.settings?.composition_info?.ad_at != null ? `<p class="discovery-note">Реклама с ${fmtDur(c.settings.composition_info.ad_at)} · ${esc(c.settings.composition_info.ad_reason)}</p>` : ""}
         <div class="clip-tools">
@@ -925,6 +951,8 @@ function clipsGridHTML() {
             ${ICONS.download}<span>Скачать MP4</span>
           </a>
           <a class="srt-btn" href="/api/clips/${c.id}/subtitles.srt" download title="Скачать субтитры (SRT)">SRT</a>
+          <button class="glass-btn" data-action="copy" title="Копировать подпись" aria-label="Копировать подпись">${ICONS.copy}</button>
+          ${c.settings?.segments ? "" : `<button class="glass-btn" data-action="edit" title="Редактировать клип" aria-label="Редактировать клип">${ICONS.edit}</button>`}
           <button class="youtube-publish-btn btn-ghost" data-youtube="${c.id}" type="button">${ICONS.play} На YouTube</button>
         </div>
       </div>
@@ -978,28 +1006,44 @@ function fallbackHTML(project) {
 function streamHomeHTML() {
   const streams = state.projects.filter((p) => p.meta && p.meta.live);
   return `
-  <section class="hero">
-    <div class="eyebrow">${ICONS.spark} Прямой эфир</div>
-    <h1 class="hero-title">Нарезки <span class="grad">по ходу стрима</span></h1>
-    <p class="hero-sub">Вставьте ссылку на идущий эфир (Twitch, Kick). Приложение запишет его локально и будет находить моменты каждые несколько минут — клипы появятся до конца трансляции.</p>
-    <div class="url-box">
-      <input id="streamInput" type="text" placeholder="https://www.twitch.tv/канал или https://kick.com/канал" autocomplete="off" spellcheck="false" />
-      <div class="seg" data-group="aspect" style="margin-top:10px">
-        ${["9:16", "1:1", "16:9", "4:5"].map((a) => `<button data-val="${a}" class="${state.opts.aspect === a ? "active" : ""}">${a}</button>`).join("")}
+  <section class="hero stream-home">
+    <div class="hero-intro">
+      <div>
+        <div class="eyebrow">${ICONS.spark} Прямой эфир</div>
+        <h1 class="hero-title">Нарезки<br><span class="grad">по ходу стрима</span></h1>
+        <p class="hero-sub">Вставьте ссылку на текущий эфир Twitch или Kick. Запись сохранится локально, а первые клипы появятся ещё во время трансляции.</p>
       </div>
-      <button class="btn-primary" id="streamStartBtn">Записать и нарезать</button>
+      <figure class="hero-visual" aria-label="Пример трансляции">
+        <div class="hero-source-frame stream-example">
+          <img src="/static/examples/stream.webp" alt="">
+          <span class="stream-example-label">Пример эфира</span>
+        </div>
+      </figure>
     </div>
-  </section>
-  <div class="section-title"><h3>Активные записи</h3></div>
-  <div class="project-list" id="streamList">${
-    streams.length ? streams.map((p) => `
-      <button class="project-item" data-project="${p.id}">
-        <span class="status-dot live"></span>
-        <span class="pi-title">${esc(p.title || p.url)}</span>
-        <span class="pi-sub">${esc(p.stage || "")} · ${Math.round((p.meta.live_duration || 0) / 60)} мин${
-          streamHint(p.meta) ? ` · ${streamHint(p.meta)}` : ""}</span>
-      </button>`).join("") : `<div class="empty-clips">Записей пока нет — вставьте ссылку на эфир.</div>`
-  }</div>`;
+    <div class="source-panel">
+      <label for="streamInput">Ссылка на трансляцию</label>
+      <div class="url-box">
+        <input id="streamInput" type="text" placeholder="https://www.twitch.tv/канал или https://kick.com/канал" autocomplete="off" spellcheck="false" />
+        <button class="btn-primary" id="streamStartBtn">Записать и нарезать</button>
+      </div>
+      <div class="stream-format">
+        <span>Формат клипов</span>
+        <div class="seg" data-group="aspect">
+          ${["9:16", "1:1", "16:9", "4:5"].map((a) => `<button data-val="${a}" class="${state.opts.aspect === a ? "active" : ""}">${a}</button>`).join("")}
+        </div>
+      </div>
+    </div>
+    <div class="section-title"><h3>Активные записи</h3></div>
+    <div class="project-list stream-list" id="streamList">${streams.length ? streams.map((p) => `
+      <button class="project-item" data-project="${esc(p.id)}">
+        <span class="project-item-icon">${ICONS.play}<span class="status-dot ${["running", "preparing", "queued"].includes(p.status) ? "live" : esc(p.status)}"></span></span>
+        <span class="stream-item-details">
+          <span class="pi-title">${esc(p.title || p.url)}</span>
+          <span class="pi-sub">${Math.round((p.meta.live_duration || 0) / 60)} мин записи</span>
+        </span>
+        <span class="stream-item-stage">${esc(streamHint(p) || p.stage || "")}</span>
+      </button>`).join("") : `<div class="empty-clips">Записей пока нет. Вставьте ссылку на эфир.</div>`}</div>
+  </section>`;
 }
 
 function streamHint(meta) {
@@ -1080,14 +1124,14 @@ function resultsHTML() {
   const { project, clips } = state.detail;
   const ready = clips.filter((c) => c.status === "ready");
   return `
-  <div class="project-head">
+  <div class="project-head results-head">
     <div>
       <h2>${esc(project.title || project.url)}</h2>
       <div class="project-meta">
         <span>${ready.length} ${plural(ready.length, "клип", "клипа", "клипов")}</span>
         ${project.duration ? `<span>${fmtDur(project.duration)} исходник</span>` : ""}
         ${qualityText(project) ? `<span>${esc(qualityText(project))}</span>` : ""}
-        ${project.language ? `<span>язык: ${esc(project.language)}</span>` : ""}
+        ${project.language ? `<span>${esc({ ru: "Русский", en: "English" }[project.language] || project.language)}</span>` : ""}
         ${project.meta?.elapsed ? `<span>обработано за ${Math.round(project.meta.elapsed)} с</span>` : ""}
       </div>
     </div>
@@ -1107,6 +1151,8 @@ function resultsHTML() {
 
 function renderMain(force) {
   const main = $("#main");
+  $("#newBtn").classList.toggle("active", !state.current && state.homeView !== "streams");
+  $("#streamBtn").classList.toggle("active", !state.current && state.homeView === "streams");
   if (!state.current || !state.detail) {
     if (!state.current) {
       main.innerHTML = heroHTML();
@@ -1403,7 +1449,7 @@ function updateTemplatePreview() {
   const upper = $("#tpUpper").checked;
   const accent = state.tmplAccent || "yellow";
   const width = stage.clientWidth || 340;
-  const px = Math.max(10, Math.round(size * 0.45 * (width / 1080)));
+  const px = Math.max(11, Math.round(size * 0.76 * (width / 1080)));
   cap.style.fontFamily = FONT_CSS[font] || "VCMontserrat";
   cap.style.fontSize = px + "px";
   cap.style.textTransform = upper ? "uppercase" : "none";
@@ -1481,15 +1527,16 @@ function openTemplate(pid) {
 
   $("#modal").innerHTML = `
     <div class="modal-backdrop" data-close="tmpl"></div>
-    <div class="modal-panel tmpl-panel">
+    <div class="modal-panel workbench tmpl-panel" role="dialog" aria-modal="true" aria-labelledby="templateTitle">
       <div class="modal-head">
-        <h3>Настройка субтитров</h3>
-        <button class="icon-btn" data-close="tmpl">${ICONS.close}</button>
+        <h3 id="templateTitle">Настройка субтитров</h3>
+        <button class="icon-btn" data-close="tmpl" aria-label="Закрыть">${ICONS.close}</button>
       </div>
       <div class="tmpl-body">
         <div class="tmpl-left">
+          <div class="preview-heading"><b>Предпросмотр</b><span>9:16</span></div>
           <div class="tmpl-stage" id="tmplStage">
-            <video id="tmplVideo" muted loop playsinline></video>
+            <video id="tmplVideo" muted loop playsinline controls aria-label="Предпросмотр субтитров"></video>
             <div class="tmpl-caption" id="tmplCaption"><span class="w hl">ПРИМЕР</span> <span class="w">СУБТИТРОВ</span></div>
             <div class="tmpl-veil" id="tmplVeil">
               <span class="spinner"></span>
@@ -1500,56 +1547,62 @@ function openTemplate(pid) {
           <div class="tmpl-hint">Так будет выглядеть вертикальный кадр. Видео можно поставить на паузу.</div>
         </div>
         <div class="tmpl-right">
-          <div class="field">
+          <div class="form-card field">
             <label>Шаблоны</label>
             <div class="preset-row">
               ${STYLE_PRESETS.map((p) => `<button class="preset-chip" data-preset="${p.key}">${p.label}</button>`).join("")}
             </div>
           </div>
-          <div class="row2">
-            <div class="field">
-              <label>Шрифт</label>
-              <div class="font-pick">
-                <select id="tpFont">
-                  ${fontOptionsHTML("")}
+          <section class="form-card form-stack">
+            <h4>Текст и положение</h4>
+            <div class="row2">
+              <div class="field">
+                <label for="tpFont">Шрифт</label>
+                <div class="font-pick">
+                  <select id="tpFont">
+                    ${fontOptionsHTML("")}
+                  </select>
+                  <button type="button" class="font-add" id="tpFontAdd" title="Загрузить свой шрифт">＋</button>
+                </div>
+              </div>
+              <div class="field">
+                <label>Положение</label>
+                <select id="tpPos">
+                  ${SUB_POSITIONS.map(([k, label]) => `<option value="${k}">${label}</option>`).join("")}
                 </select>
-                <button type="button" class="font-add" id="tpFontAdd" title="Загрузить свой шрифт">＋</button>
+              </div>
+            </div>
+            <div class="row2">
+              <div class="field">
+                <label>Размер <b id="tpSizeVal">118</b></label>
+                <input type="range" id="tpSize" min="70" max="180" step="2" value="118" />
+              </div>
+              <div class="field">
+                <label>Сдвиг <b id="tpOffsetVal">0</b></label>
+                <input type="range" id="tpOffset" min="-120" max="180" step="5" value="0" />
+              </div>
+            </div>
+          </section>
+          <div class="form-card field">
+            <label>Темп субтитров</label>
+            <div class="seg" id="tpSpeed">
+              ${SUB_SPEEDS.map(([k, label]) => `<button data-val="${k}" class="${k === "calm" ? "active" : ""}">${label}</button>`).join("")}
+            </div>
+            <small class="form-hint">В режиме «Спокойно» фразы дольше остаются на экране.</small>
+          </div>
+          <div class="form-card template-decoration">
+            <div class="field">
+              <label>Цвет подсветки</label>
+              <div class="swatches" id="tpAccents">
+                ${swatchesHTML(state.tmplAccent || "yellow")}
               </div>
             </div>
             <div class="field">
-              <label>Положение</label>
-              <select id="tpPos">
-                ${SUB_POSITIONS.map(([k, label]) => `<option value="${k}">${label}</option>`).join("")}
-              </select>
-            </div>
-          </div>
-          <div class="row2">
-            <div class="field">
-              <label>Размер <b id="tpSizeVal">118</b></label>
-              <input type="range" id="tpSize" min="70" max="180" step="2" value="118" />
-            </div>
-            <div class="field">
-              <label>Сдвиг <b id="tpOffsetVal">0</b></label>
-              <input type="range" id="tpOffset" min="-120" max="180" step="5" value="0" />
-            </div>
-          </div>
-          <div class="field">
-            <label>Темп субтитров</label>
-            <div class="seg" id="tpSpeed">
-              ${SUB_SPEEDS.map(([k, label]) => `<button data-val="${k}" class="active">${label}</button>`).join("")}
-            </div>
-          </div>
-          <div class="field">
-            <label>Цвет подсветки</label>
-            <div class="swatches" id="tpAccents">
-              ${swatchesHTML(state.tmplAccent || "yellow")}
-            </div>
-          </div>
-          <div class="field">
-            <label>Оформление</label>
-            <div style="display:flex;gap:14px;flex-wrap:wrap">
-              <label class="toggle"><input type="checkbox" id="tpUpper" checked/><span class="track"></span><span>КАПСОМ</span></label>
-              <label class="toggle"><input type="checkbox" id="tpHook" checked/><span class="track"></span><span>Хук сверху</span></label>
+              <label>Оформление</label>
+              <div class="toggle-group">
+                <label class="toggle"><input type="checkbox" id="tpUpper" checked/><span class="track"></span><span>КАПСОМ</span></label>
+                <label class="toggle"><input type="checkbox" id="tpHook" checked/><span class="track"></span><span>Хук сверху</span></label>
+              </div>
             </div>
           </div>
           <div class="tmpl-meta" id="tmplMeta"></div>
@@ -1729,109 +1782,125 @@ function openEditor(clipId) {
 
   $("#modal").innerHTML = `
     <div class="modal-backdrop" data-close></div>
-    <div class="modal-panel">
+    <div class="modal-panel workbench editor-panel" role="dialog" aria-modal="true" aria-labelledby="editorTitle">
       <div class="modal-head">
-        <h3>Редактировать клип</h3>
-        <button class="icon-btn" data-close>${ICONS.close}</button>
+        <div><h3 id="editorTitle">Редактировать клип</h3><div class="dialog-subtitle">${esc(clip.title || "")}</div></div>
+        <button class="icon-btn" data-close aria-label="Закрыть">${ICONS.close}</button>
       </div>
-      <div class="modal-body">
-        <div class="editor-video"><video id="edVideo" src="${clipUrl(clip)}" controls playsinline></video></div>
-        <div class="editor-fields">
-          <div class="field">
-            <label>Заголовок на видео (хук)</label>
-            <input type="text" id="edHook" maxlength="90" value="${esc(clip.hook || clip.title || "")}" />
-          </div>
-          <div class="field">
-            <label>Текст субтитров <span style="color:var(--muted-2);font-weight:400">— правьте имена и термины, тайминги сохранятся</span></label>
-            <textarea id="edText" rows="3" style="width:100%;resize:vertical">${esc((clip.words || []).map((w) => w.word).join(" "))}</textarea>
-          </div>
-          <div class="row2">
+      <div class="modal-body editor-body">
+        <div class="editor-preview">
+          <div class="preview-heading"><b>Предпросмотр</b><span>${esc(s.aspect || "9:16")}</span></div>
+          <div class="editor-video"><video id="edVideo" src="${clipUrl(clip)}" controls playsinline aria-label="Предпросмотр клипа"></video></div>
+        </div>
+        <div class="form-stack">
+          <section class="form-card form-stack">
+            <h4>Текст клипа</h4>
             <div class="field">
-              <label>Начало</label>
-              <div class="range-row">
-                <input type="range" id="edStart" min="0" max="${maxT}" step="0.1" value="${clip.start}" />
-                <input type="number" id="edStartNum" min="0" max="${maxT}" step="0.1" value="${clip.start.toFixed(1)}" />
+              <label for="edHook">Заголовок на видео (хук)</label>
+              <input type="text" id="edHook" maxlength="90" value="${esc(clip.hook || clip.title || "")}" />
+            </div>
+            <div class="field">
+              <label for="edText">Текст субтитров</label>
+              <textarea id="edText" rows="3" style="width:100%;resize:vertical">${esc((clip.words || []).map((w) => w.word).join(" "))}</textarea>
+              <small class="form-hint">При правке текста тайминги сохранятся.</small>
+            </div>
+          </section>
+          <section class="form-card form-stack">
+            <h4>Границы клипа</h4>
+            <div class="row2">
+              <div class="field">
+                <label for="edStartNum">Начало</label>
+                <div class="range-row">
+                  <input type="range" id="edStart" min="0" max="${maxT}" step="0.1" value="${clip.start}" />
+                  <input type="number" id="edStartNum" min="0" max="${maxT}" step="0.1" value="${clip.start.toFixed(1)}" />
+                </div>
+              </div>
+              <div class="field">
+                <label for="edEndNum">Конец</label>
+                <div class="range-row">
+                  <input type="range" id="edEnd" min="0" max="${maxT}" step="0.1" value="${clip.end}" />
+                  <input type="number" id="edEndNum" min="0" max="${maxT}" step="0.1" value="${clip.end.toFixed(1)}" />
+                </div>
+              </div>
+            </div>
+          </section>
+          <section class="form-card form-stack">
+            <h4>Видео и звук</h4>
+            <div class="row2">
+              <div class="field">
+                <label for="edAspect">Формат</label>
+                <select id="edAspect">
+                  ${["9:16", "1:1", "16:9", "4:5"].map((a) => `<option value="${a}" ${(s.aspect || "9:16") === a ? "selected" : ""}>${a}</option>`).join("")}
+                </select>
+              </div>
+              <div class="field">
+                <label>Звуковая дорожка</label>
+                <select id="edAudio"><option value="0">основная</option></select>
               </div>
             </div>
             <div class="field">
-              <label>Конец</label>
-              <div class="range-row">
-                <input type="range" id="edEnd" min="0" max="${maxT}" step="0.1" value="${clip.end}" />
-                <input type="number" id="edEndNum" min="0" max="${maxT}" step="0.1" value="${clip.end.toFixed(1)}" />
-              </div>
-            </div>
-          </div>
-          <div class="row2">
-            <div class="field">
-              <label>Формат</label>
-              <select id="edAspect">
-                ${["9:16", "1:1", "16:9", "4:5"].map((a) => `<option value="${a}" ${(s.aspect || "9:16") === a ? "selected" : ""}>${a}</option>`).join("")}
-              </select>
-            </div>
-            <div class="field">
-              <label>Звуковая дорожка</label>
-              <select id="edAudio"><option value="0">основная</option></select>
-            </div>
-            <div class="field">
-              <label>Кадрирование</label>
+              <label for="edMode">Кадрирование</label>
               <select id="edMode">
                 <option value="auto" ${s.mode === "auto" ? "selected" : ""}>Умный кроп (по лицу)</option>
                 <option value="blur" ${s.mode === "blur" || !s.mode ? "selected" : ""}>Размытый фон</option>
                 <option value="crop" ${s.mode === "crop" ? "selected" : ""}>По центру</option>
               </select>
             </div>
-          </div>
-          <div class="field">
-            <label>Субтитры</label>
-            <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+          </section>
+        </div>
+        <div class="form-stack">
+          <section class="form-card form-stack">
+            <h4>Субтитры</h4>
+            <div class="toggle-group editor-toggles">
               <label class="toggle"><input type="checkbox" id="edSubs" ${s.subtitles !== false ? "checked" : ""}/><span class="track"></span><span>Показывать</span></label>
               <label class="toggle"><input type="checkbox" id="edUpper" ${s.uppercase !== false ? "checked" : ""}/><span class="track"></span><span>КАПСОМ</span></label>
               <label class="toggle"><input type="checkbox" id="edShowHook" ${s.show_hook !== false ? "checked" : ""}/><span class="track"></span><span>Хук сверху</span></label>
               <label class="toggle"><input type="checkbox" id="edCutPauses" ${s.cut_pauses ? "checked" : ""}/><span class="track"></span><span>Вырезать паузы</span></label>
             </div>
-          </div>
-          <div class="row2">
-            <div class="field">
-              <label>Шрифт субтитров</label>
-              <div class="font-pick">
-                <select id="edFont">
-                  ${fontOptionsHTML(fontKey)}
-                </select>
-                <button type="button" class="font-add" id="edFontAdd" title="Загрузить свой шрифт">＋</button>
+            <div class="row2">
+              <div class="field">
+                <label for="edFont">Шрифт</label>
+                <div class="font-pick">
+                  <select id="edFont">
+                    ${fontOptionsHTML(fontKey)}
+                  </select>
+                  <button type="button" class="font-add" id="edFontAdd" title="Загрузить свой шрифт">＋</button>
+                </div>
+                <div class="font-sample ed-sample" id="edFontSample" style="font-family:${FONT_CSS[fontKey] || "VCMontserrat"}">ПРИМЕР СУБТИТРОВ</div>
               </div>
-              <div class="font-sample ed-sample" id="edFontSample" style="font-family:${FONT_CSS[fontKey] || "VCMontserrat"}">ПРИМЕР СУБТИТРОВ</div>
+              <div class="field">
+                <label>Положение</label>
+                <select id="edPos">
+                  ${SUB_POSITIONS.map(([k, label]) => `<option value="${k}" ${fontPos === k ? "selected" : ""}>${label}</option>`).join("")}
+                </select>
+              </div>
             </div>
-            <div class="field">
-              <label>Положение</label>
-              <select id="edPos">
-                ${SUB_POSITIONS.map(([k, label]) => `<option value="${k}" ${fontPos === k ? "selected" : ""}>${label}</option>`).join("")}
-              </select>
+            <div class="row2">
+              <div class="field">
+                <label>Размер <b id="edSizeVal">${fontSize}</b></label>
+                <input type="range" id="edSize" min="70" max="180" step="2" value="${fontSize}" />
+              </div>
+              <div class="field">
+                <label>Сдвиг <b id="edOffVal">${fontOffset}</b></label>
+                <input type="range" id="edOffset" min="-120" max="180" step="5" value="${fontOffset}" />
+              </div>
             </div>
-          </div>
-          <div class="row2">
-            <div class="field">
-              <label>Размер <b id="edSizeVal">${fontSize}</b></label>
-              <input type="range" id="edSize" min="70" max="180" step="2" value="${fontSize}" />
-            </div>
-            <div class="field">
-              <label>Сдвиг <b id="edOffVal">${fontOffset}</b></label>
-              <input type="range" id="edOffset" min="-120" max="180" step="5" value="${fontOffset}" />
-            </div>
-          </div>
-          <div class="field">
+          </section>
+          <div class="form-card field">
             <label>Темп субтитров</label>
             <div class="seg" id="edSpeed">
               ${SUB_SPEEDS.map(([k, label]) => `<button data-val="${k}" class="${subSpeed === k ? "active" : ""}">${label}</button>`).join("")}
             </div>
+            <small class="form-hint">В режиме «Спокойно» фразы дольше остаются на экране.</small>
           </div>
-          <div class="field">
+          <div class="form-card field">
             <label>Цвет подсветки</label>
             <div class="swatches" id="edAccents">
               ${swatchesHTML(accent)}
             </div>
           </div>
-          <div class="field">
-            <label>Подпись для публикации</label>
+          <div class="form-card field">
+            <label for="edCaption">Подпись для публикации</label>
             <textarea id="edCaption">${esc(clip.caption || "")}</textarea>
           </div>
         </div>
@@ -1896,6 +1965,7 @@ function openEditor(clipId) {
     const payload = {
       start: Number(start.value),
       end: Number(end.value),
+      audio_track: $("#edAudio").options.length > 1 ? Number($("#edAudio").value) : undefined,
       hook: $("#edHook").value,
       caption: $("#edCaption").value,
       text: (() => {
@@ -2036,6 +2106,7 @@ async function checkHealth() {
     const h = await api("/api/health");
     state.health = h;
     const el = $("#health");
+    $("#appVersion").textContent = h.version || "";
     el.classList.toggle("ok", !!h.ok);
     el.classList.toggle("bad", !h.ok);
     $("#healthText").textContent = h.ok
@@ -2097,6 +2168,14 @@ const fmtGb = (mb) => (mb / 1024).toFixed(1).replace(".", ",");
 
 function renderSystem(data) {
   if (!data) return;
+  const fallback = data.app?.encoder_fallback;
+  if (fallback && fallback.id !== state.encoderFallbackId) {
+    state.encoderFallbackId = fallback.id;
+    const reason = fallback.reason === "gpu_unavailable"
+      ? "Аппаратный кодировщик недоступен."
+      : "Кодирование на видеокарте не удалось.";
+    toast(`${reason} ViralCut продолжает на процессоре.`, "err");
+  }
   if (data.disabled) {
     const card = $("#sysCard");
     if (card) card.style.display = "none";
@@ -2191,37 +2270,33 @@ async function openSettings() {
   const modes = [["auto", "Авто"], ["gpu", "Видеокарта"], ["cpu", "Процессор"]];
   $("#modal").innerHTML = `
     <div class="modal-backdrop" data-close></div>
-    <div class="modal-panel settings-panel" style="max-width:520px">
+    <div class="modal-panel workbench settings-panel" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
       <div class="modal-head">
-        <h3>Настройки</h3>
-        <button class="icon-btn" data-close>${ICONS.close}</button>
+        <h3 id="settingsTitle">Настройки</h3>
+        <button class="icon-btn" data-close aria-label="Закрыть">${ICONS.close}</button>
       </div>
-      <div class="modal-body">
-        <div class="set-section">
-          <div class="set-label">Чем кодировать клипы</div>
+      <div class="modal-body settings-body">
+        <div class="form-card set-section">
+          <h4>Кодирование клипов</h4>
           <div class="set-seg" id="setEncoder">
             ${modes.map(([k, label]) => `<button data-val="${k}" class="${conf.encoder === k ? "active" : ""}">${label}</button>`).join("")}
           </div>
           <div class="set-hint">
-            Видеокарта — быстрее и не грузит процессор${conf.hw_available ? ` (доступно: ${esc(conf.hw_available)})` : " (аппаратный энкодер не найден)"}.
-            Процессор — чуть выше качество на сложных сценах.
+            Видеокарта ускоряет кодирование, когда доступен аппаратный кодировщик${conf.hw_available ? ` (${esc(conf.hw_available)})` : ""}.
           </div>
         </div>
-        <div class="set-section">
-          <div class="set-label">Куда сохранять скачанные видео</div>
+        <div class="form-card set-section paths-section">
+          <h4>Папки сохранения</h4>
+          <label for="setDownloadDir">Скачанные видео</label>
           <div class="set-path">
             <input type="text" id="setDownloadDir" placeholder="Спросить при первом сохранении" value="${esc(conf.download_dir || "")}" />
             <button class="btn-ghost" type="button" id="setDownloadPick">Выбрать…</button>
           </div>
-        </div>
-        <div class="set-section">
-          <div class="set-label">Куда сохранять готовые клипы</div>
+          <label for="setClipsDir">Готовые клипы</label>
           <div class="set-path">
             <input type="text" id="setClipsDir" placeholder="Загрузки/ViralCut" value="${esc(conf.clips_dir || "")}" />
             <button class="btn-ghost" type="button" id="setClipsPick">Выбрать…</button>
           </div>
-        </div>
-        <div class="set-section">
           <label class="toggle"><input type="checkbox" id="setAskFolder" ${conf.ask_folder ? "checked" : ""}/><span class="track"></span><span>Спрашивать папку при каждом сохранении</span></label>
         </div>
         <div class="set-section" id="youtubeSettingsSection">
@@ -2239,10 +2314,12 @@ async function openSettings() {
           <div class="set-hint">Доступ сохраняется в системном хранилище паролей. Видео отправляется только по кнопке публикации.</div>
           <p id="youtubeSettingsMessage" role="status" class="set-hint"></p>
         </div>
-        <div class="set-section">
-          <div class="set-label">Журнал приложения</div>
-          <div class="set-hint">Если приложение закрылось само (например, при «Пересобрать»), здесь видно, на каком этапе это случилось и с какой ошибкой.</div>
-          <button class="btn-ghost" type="button" id="setDiag">Разобрать журнал</button>
+        <div class="form-card set-section">
+          <h4>Журнал приложения</h4>
+          <div class="settings-log">
+            <div class="set-hint">Показывает, на каком этапе произошла ошибка.</div>
+            <button class="btn-ghost" type="button" id="setDiag">Разобрать журнал</button>
+          </div>
           <pre id="setDiagOut" class="diag-out hidden"></pre>
         </div>
       </div>
@@ -2282,7 +2359,7 @@ async function openSettings() {
     const btn = $("#setSave");
     btn.disabled = true;
     try {
-      await api("/api/settings", {
+      const saved = await api("/api/settings", {
         method: "POST",
         body: JSON.stringify({
           encoder,
@@ -2292,7 +2369,8 @@ async function openSettings() {
         }),
       });
       closeModal();
-      toast("Настройки сохранены");
+      if (saved.encoder_warning) toast(saved.encoder_warning, "err");
+      else toast("Настройки сохранены");
       pollSystem();
     } catch (e) {
       toast(e.message, "err");
@@ -2305,15 +2383,20 @@ async function openSettings() {
 function bindHud() {
   const head = $("#sysToggle");
   const card = $("#sysCard");
-  if (!head || !card) return;
+  const dock = $("#hudDock");
+  if (!head || !card || !dock) return;
+  const setCollapsed = (collapsed) => {
+    card.classList.toggle("collapsed", collapsed);
+    head.setAttribute("aria-expanded", String(!collapsed));
+  };
   const phone = window.matchMedia("(max-width: 640px)").matches;
-  if (phone) card.classList.add("collapsed");
   try {
-    if (localStorage.getItem("vcHudCollapsed") === "1") card.classList.add("collapsed");
+    setCollapsed(localStorage.getItem("vcHudCollapsed") !== "0");
   } catch (_) {}
 
   // сохранённая позиция: пользователь мог перетащить панель
   const placeHud = (x, y) => {
+    if (card.parentElement === dock) document.body.append(card);
     const r = card.getBoundingClientRect();
     const left = Math.min(Math.max(8, x), Math.max(8, window.innerWidth - r.width - 8));
     const top = Math.min(Math.max(8, y), Math.max(8, window.innerHeight - r.height - 8));
@@ -2332,6 +2415,7 @@ function bindHud() {
   }
   window.addEventListener("resize", () => {
     if (window.matchMedia("(max-width: 640px)").matches) {
+      dock.append(card);
       for (const edge of ["left", "top", "right", "bottom"]) card.style.removeProperty(edge);
       card.classList.add("collapsed");
       return;
@@ -2354,8 +2438,12 @@ function bindHud() {
   head.addEventListener("pointermove", (e) => {
     if (!drag) return;
     if (!drag.moved && Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < 4) return;
+    const undocking = card.parentElement === dock;
     drag.moved = true;
     placeHud(e.clientX - drag.offX, e.clientY - drag.offY);
+    if (undocking) {
+      try { head.setPointerCapture(e.pointerId); } catch (_) {}
+    }
   });
   const finish = (e) => {
     if (!drag) return;
@@ -2368,14 +2456,17 @@ function bindHud() {
       try { localStorage.setItem("vcHudPos", JSON.stringify({ x: r.left, y: r.top })); } catch (_) {}
       return;
     }
-    // это был клик, а не перетаскивание — сворачиваем
-    card.classList.toggle("collapsed");
+    toggleHud();
+  };
+  const toggleHud = () => {
+    setCollapsed(!card.classList.contains("collapsed"));
     try {
       localStorage.setItem("vcHudCollapsed", card.classList.contains("collapsed") ? "1" : "0");
     } catch (_) {}
   };
   head.addEventListener("pointerup", finish);
   head.addEventListener("pointercancel", finish);
+  head.addEventListener("click", (e) => { if (!e.detail) toggleHud(); });
 }
 
 /* ---------------- Окно стримера (камера) ---------------- */

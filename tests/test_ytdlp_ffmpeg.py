@@ -94,5 +94,37 @@ class YtDlpSeesFfmpegTest(_TempData):
         self.assertIn("VIRALCUT_FFMPEG", message)
 
 
+class YouTubeQualityTest(unittest.TestCase):
+    def test_pot_client_is_checked_after_sd_response(self):
+        sd = {"formats": [{"format_id": "18", "vcodec": "avc1", "height": 360}]}
+        hd = {"formats": [{"format_id": "137", "vcodec": "avc1", "height": 1080}]}
+        with mock.patch("yt_dlp.YoutubeDL") as ydl, mock.patch.object(downloader, "ensure_path"), \
+             mock.patch.dict(os.environ, {"VIRALCUT_NODE": "node.exe",
+                                          "VIRALCUT_POT_URL": "http://127.0.0.1:4416"}):
+            ydl.return_value.__enter__.return_value.extract_info.side_effect = [sd, sd, hd]
+            info, args, label = downloader._youtube_info("https://youtube.com/watch?v=test", None, True)
+        self.assertEqual(info, hd)
+        self.assertEqual(label, "PO-token")
+        self.assertEqual(args["youtube"]["fetch_pot"], ["always"])
+        self.assertEqual(ydl.call_args.args[0]["js_runtimes"], {"node": {"path": "node.exe"}})
+
+    def test_sd_requested_uses_the_first_suitable_response(self):
+        sd = {"formats": [{"format_id": "18", "vcodec": "avc1", "height": 360}]}
+        with mock.patch("yt_dlp.YoutubeDL") as ydl, mock.patch.object(downloader, "ensure_path"):
+            ydl.return_value.__enter__.return_value.extract_info.return_value = sd
+            info, _, _ = downloader._youtube_info("https://youtube.com/watch?v=test", None, True,
+                                                  preferred_height=360)
+        ydl.assert_called_once()
+        self.assertEqual(info, sd)
+
+    def test_hd_is_preferred_over_lower_avc_format(self):
+        formats = [
+            {"format_id": "18", "vcodec": "avc1", "acodec": "mp4a", "ext": "mp4", "height": 360},
+            {"format_id": "248", "vcodec": "vp9", "ext": "webm", "height": 1080},
+            {"format_id": "140", "acodec": "mp4a", "ext": "m4a"},
+        ]
+        self.assertEqual(downloader._pick_format({"formats": formats}, 1080), ("248+140", 1080))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

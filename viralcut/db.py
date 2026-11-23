@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import DB_PATH
@@ -276,3 +277,10 @@ def reset_stale_jobs() -> None:
             "UPDATE projects SET status='error', error='Обработка прервана перезапуском сервера',"
             " stage='Ошибка' WHERE status IN ('queued','running','preparing','processing')"
         )
+        for clip in conn.execute("SELECT id, path FROM clips WHERE status='rendering'").fetchall():
+            ready = bool(clip["path"] and Path(clip["path"]).is_file())
+            conn.execute(
+                "UPDATE clips SET status=?, error=?, updated_at=? WHERE id=?",
+                ("ready" if ready else "error", "Рендер прерван перезапуском приложения",
+                 time.time(), clip["id"]),
+            )

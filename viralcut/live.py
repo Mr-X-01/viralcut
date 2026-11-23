@@ -633,7 +633,8 @@ def _absolute_words(words: List[Dict[str, Any]], clip_start: float) -> List[Dict
 
 def _render_live_clip(workdir: Path, clip: Dict[str, Any], win_start: float,
                       settings: Dict[str, Any],
-                      opts: Optional[Dict[str, Any]] = None) -> None:
+                      opts: Optional[Dict[str, Any]] = None, *,
+                      clip_updates: Optional[Dict[str, Any]] = None) -> None:
     start = float(clip["start"]) - win_start
     end = float(clip["end"]) - win_start
     src = workdir / f"src_{clip['id']}.mp4"
@@ -658,7 +659,8 @@ def _render_live_clip(workdir: Path, clip: Dict[str, Any], win_start: float,
               "end": float(w["end"]) - win_start - start} for w in clip["words"]]
     virtual = {**clip, "start": 0.0, "end": end - start, "words": words}
     try:
-        pipeline._render_one(src, workdir, virtual, settings, None, opts or {})
+        pipeline._render_one(src, workdir, virtual, settings, None, {**(opts or {}), "audio_track": 0},
+                             clip_updates=clip_updates, timeline_offset=float(clip["start"]))
     finally:
         src.unlink(missing_ok=True)
 

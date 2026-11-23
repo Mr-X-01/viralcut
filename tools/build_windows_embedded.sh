@@ -8,6 +8,7 @@
 #
 # Подготовка колёс (один раз):
 #   python tools/resolve_windows_wheels.py --dest build/windows-wheels
+# WINDOWS_VENDOR указывает на папку Windows x64 с node.exe, pot/ и ejs/.
 # Сборка:
 #   ./tools/build_windows_embedded.sh
 set -euo pipefail
@@ -17,6 +18,7 @@ VERSION="$(python3 tools/version.py)"
 PY_EMBED_VER="${PY_EMBED_VER:-3.12.10}"
 WHEELS="${WHEELS:-build/windows-wheels}"
 MODEL="${MODEL:-build/whisper-small}"
+WINDOWS_VENDOR="${WINDOWS_VENDOR:-build/windows-vendor-x64}"
 STAGE="build/windows-embedded"
 OUTDIR="dist"
 NAME="ViralCut-${VERSION}-windows-x64-portable"
@@ -24,6 +26,32 @@ OUT="$OUTDIR/$NAME.zip"
 
 [ -d "$WHEELS" ] || { echo "Нет колёс: $WHEELS. Запустите tools/resolve_windows_wheels.py"; exit 1; }
 [ -f "$MODEL/model.bin" ] || { echo "Нет модели: $MODEL/model.bin"; exit 1; }
+
+python3 - "$WINDOWS_VENDOR" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+vendor = Path(sys.argv[1])
+for marker in ("pot/build/main.js", "ejs/challenge-solver/lib.json"):
+    if not (vendor / marker).is_file():
+        raise SystemExit(f"В Windows-комплекте провайдера нет {marker}: {vendor}")
+
+for relative in ("node.exe", "pot/node_modules/canvas/build/Release/canvas.node"):
+    path = vendor / relative
+    if not path.is_file():
+        raise SystemExit(f"Не найден бинарник Windows x64: {path}")
+    with path.open("rb") as binary:
+        header = binary.read(64)
+        if len(header) == 64 and header.startswith(b"MZ"):
+            binary.seek(struct.unpack_from("<I", header, 60)[0])
+            if binary.read(6) == b"PE\x00\x00\x64\x86":
+                continue
+    raise SystemExit(f"Ожидался PE-бинарник Windows x64: {path}")
+
+if any(path.is_symlink() for path in vendor.rglob("*")):
+    raise SystemExit(f"В Windows-комплекте провайдера не должно быть симлинков: {vendor}")
+PY
 
 PYCACHE="build/python-embed-$PY_EMBED_VER.zip"
 if [ ! -f "$PYCACHE" ]; then
@@ -66,7 +94,7 @@ cp -R viralcut "$APPDIR/viralcut"
 cp -R web "$APPDIR/web"
 cp -R assets "$APPDIR/assets"
 cp desktop/main.py "$APPDIR/desktop/main.py"
-cp desktop/vendor.tar.gz "$APPDIR/desktop/vendor.tar.gz"
+cp -R "$WINDOWS_VENDOR" "$APPDIR/desktop/vendor"
 cp tools/analyze_app_log.py "$APPDIR/tools/analyze_app_log.py"
 cp LICENSE "$APPDIR/LICENSE"
 cp -R "$MODEL" "$APPDIR/models/whisper-small"
@@ -135,7 +163,7 @@ sh.Run """" & root & "\ViralCut.bat""", 0, False
 write("README-WINDOWS-PORTABLE.txt", f'''ViralCut {version} — переносимая сборка для Windows 10/11 x64
 ==========================================================
 
-Внутри уже есть всё: Python, зависимости, ffmpeg и модель распознавания речи.
+Внутри Python, FFmpeg, модель распознавания речи и провайдер YouTube с Node.js для Windows x64.
 Докачивать ничего не нужно — только распаковать и запустить.
 
 Запуск

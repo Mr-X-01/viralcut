@@ -1,13 +1,14 @@
 """Оркестрация: скачивание → распознавание → поиск моментов → рендер клипов."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import sys
+import tempfile
 import threading
 import time
-import json
-import sys
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -491,6 +492,8 @@ def process_project(pid: str) -> None:
 
     info = utils.probe(source)
     duration = info["duration"]
+    audio_track = opts["audio_track"] if opts["audio_track"] < info["audio_tracks"] else 0
+    opts["audio_track"] = audio_track
 
     try:
         progress(0.05, "Распознавание речи")
@@ -502,10 +505,14 @@ def process_project(pid: str) -> None:
             transcript = transcribe.transcribe(
                 source, workdir, language=opts.get("language") or None,
                 on_progress=lambda p, s: progress(0.05 + p * 0.45, f"{s} {int(p*100)}%"),
+                audio_track=audio_track,
             )
             stop_hb.set(); hb_thread.join(timeout=1)
         except Exception as exc:  # noqa: BLE001
             stop_hb.set(); hb_thread.join(timeout=1)
+            if info["audio_tracks"] > 1:
+                # У субтитров площадки нет привязки к выбранной звуковой дорожке.
+                raise RuntimeError("Не удалось распознать выбранную аудиодорожку. " + str(exc)[:300]) from exc
             sub_path = downloader.fetch_subtitles(project["url"], workdir,
                                                   browser=opts.get("cookies_browser") or None)
             if sub_path:
@@ -528,6 +535,7 @@ def process_project(pid: str) -> None:
             count=opts["count"] or 0,
             min_dur=opts["min_dur"], max_dur=opts["max_dur"],
             target_dur=opts["target_dur"],
+            audio_track=audio_track,
         )
         if not found:
             raise RuntimeError("Не нашлось связных фрагментов. Попробуйте увеличить длину клипа.")
@@ -633,27 +641,62 @@ def run_project(pid: str) -> None:
     process_project(pid)
 
 
-def _pause_spans(source: Path, start: float, end: float) -> List[Dict[str, float]]:
+def _pause_spans(source: Path, start: float, end: float, *,
+                 audio_track: Optional[int] = None) -> List[Dict[str, float]]:
     """План склейки окна без пауз; пустой список — резать нечего.
 
     Порог паузы 0.45 с и запас 0.12 с по краям: дыхание и микропаузы внутри
     фразы остаются, а «эээ…» и молчание между мыслями исчезают.
     """
     try:
-        curve, mean_db = analyze.cached_energy_curve(source)
+        curve, mean_db = analyze.cached_energy_curve(source, audio_track=audio_track)
         if not curve:
             return []
         gaps = analyze.silence_gaps(curve, mean_db, start, end)
-        spans = analyze.cut_plan(start, end, gaps)
-        return spans if len(spans) > 1 else []
+        spans = render._cut_spans(analyze.cut_plan(start, end, gaps), start, end)
+        offset = 0.0
+        for span in spans:
+            span["output"] = round(offset, 3)
+            offset += span["end"] - span["start"]
+        return spans
     except Exception as exc:  # noqa: BLE001 — без плана рендерим как обычно
         print(f"[render] паузы не вырезаны: {exc}", file=sys.stderr, flush=True)
         return []
 
 
+def _subtitle_timeline(clip: Dict[str, Any], spans: List[Dict[str, float]]
+                       ) -> Tuple[List[Dict[str, Any]], float, float]:
+    words = clip.get("words") or []
+    if not spans:
+        return words, float(clip["start"]), float(clip["end"])
+    end = round(sum(span["end"] - span["start"] for span in spans), 3)
+    return analyze.remap_words(words, spans), 0.0, end
+
+
+def clip_srt(clip: Dict[str, Any]) -> str:
+    settings = clip["settings"]
+    spans = settings.get("rendered_spans")
+    if spans is None and settings.get("cut_pauses") and not settings.get("segments"):
+        # У старых клипов план не записывался. Исходный детектор выбирал звук
+        # автоматически. Сверяем план с длиной готового MP4, прежде чем его применять.
+        output = clip.get("path")
+        output_length = utils.media_duration(Path(output)) if output and Path(output).is_file() else 0.0
+        uncut_length = float(clip["end"]) - float(clip["start"])
+        if not output_length or abs(output_length - uncut_length) > 0.15:
+            project = db.get_project(clip["project_id"]) or {}
+            source = project.get("source")
+            if source and Path(source).is_file():
+                spans = _pause_spans(Path(source), float(clip["start"]), float(clip["end"]))
+            if not spans or (output_length and abs(_subtitle_timeline(clip, spans)[2] - output_length) > 0.15):
+                raise ValueError("Пересоберите клип, чтобы восстановить точный тайминг SRT.")
+    return subtitles.to_srt(*_subtitle_timeline(clip, spans or []))
+
+
 def _render_one(source: Path, workdir: Path, clip: Dict[str, Any],
                 settings: Dict[str, Any], on_progress: Optional[Callable[[float], None]] = None,
-                opts: Optional[Dict[str, Any]] = None) -> None:
+                opts: Optional[Dict[str, Any]] = None, *,
+                clip_updates: Optional[Dict[str, Any]] = None,
+                timeline_offset: float = 0.0) -> None:
     out_dir = workdir / "clips"
     ass_dir = workdir / "ass"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -673,37 +716,10 @@ def _render_one(source: Path, workdir: Path, clip: Dict[str, Any],
     # кадрирования пересчитываем на новое время — иначе субтитры и кроп
     # отставали бы на длину вырезанного.
     spans: List[Dict[str, float]] = []
-    words = list(clip["words"] or [])
+    audio_track = int((opts or {}).get("audio_track") or 0)
     if settings.get("cut_pauses") and not settings.get("segments"):
-        spans = _pause_spans(source, float(clip["start"]), float(clip["end"]))
-        if spans:
-            words = analyze.remap_words(words, spans)
-
-    ass_path = None
-    if settings.get("subtitles", True) and words:
-        text = subtitles.build_ass(
-            words, 0.0 if spans else clip["start"],
-            round(spans[-1]["output"] + (spans[-1]["end"] - spans[-1]["start"]), 3)
-            if spans else clip["end"],
-            hook=clip.get("hook") or clip.get("title") or "",
-            accent=settings.get("accent", "yellow"),
-            uppercase=settings.get("uppercase", True),
-            show_hook=settings.get("show_hook", True),
-            sub_size=int(settings.get("sub_size", 118)),
-            font=settings.get("sub_font", "montserrat"),
-            position=settings.get("sub_position", "bottom"),
-            offset=int(settings.get("sub_offset", 0)),
-            speed=settings.get("sub_speed", "calm"),
-        )
-        if panel_size:
-            import re
-            # Render captions into the panel at full width, without squeezing a portrait clip.
-            panel_h = panel_size[1]
-            text = text.replace("PlayResY: 1920", f"PlayResY: {panel_h}")
-            text = re.sub(r"\\pos\(([^,]+),([0-9.]+)\)",
-                          lambda m: f"\\pos({m[1]},{float(m[2])*panel_h/1920:.1f})", text)
-        ass_path = ass_dir / f"{clip['id']}.ass"
-        ass_path.write_text(text, encoding="utf-8")
+        spans = _pause_spans(source, float(clip["start"]), float(clip["end"]), audio_track=audio_track)
+    words, sub_start, sub_end = _subtitle_timeline(clip, spans)
 
     out_path = out_dir / f"clip_{clip['idx'] + 1:02d}.mp4"
     crop_path = None
@@ -721,25 +737,85 @@ def _render_one(source: Path, workdir: Path, clip: Dict[str, Any],
         if crop_path and crop_path.get("coverage", 1.0) < 0.18:
             mode = "crop"
             crop_path = None
-    render.render_clip(
-        source, clip["start"], clip["end"], out_path, ass_path=ass_path,
-        aspect=settings.get("aspect", "9:16"), mode=mode,
-        focus_x=float(settings.get("focus_x", 0.5)), on_progress=on_progress,
-        crop_path=crop_path, pip=pip_options(opts or {}),
-        audio_track=int((opts or {}).get("audio_track") or 0),
-        spans=spans or None, output_size=panel_size,
-    )
-    if (opts or {}).get("composition"):
-        from . import composition
-        report = composition.apply(out_path, opts["composition"],
-                                   canvas=render.ASPECTS.get(settings.get("aspect", "9:16")),
-                                   main_prepared=bool(panel_size), variation=int(clip["idx"]))
-        db.update_clip(clip["id"], settings={**settings, "composition_info": report})
     thumb_path = workdir / "thumbs" / f"{clip['id']}.jpg"
-    render.make_thumb(out_path, thumb_path, at=min(1.2, max(0.2, (clip["end"] - clip["start"]) * 0.15)))
-    render.make_preview(out_path, workdir / "previews" / f"{clip['id']}.mp4")
-    db.update_clip(clip["id"], status="ready", path=str(out_path),
-                   thumb=str(thumb_path) if thumb_path.exists() else None, error=None)
+    preview_path = workdir / "previews" / f"{clip['id']}.mp4"
+    with tempfile.TemporaryDirectory(prefix=".clip-", dir=out_dir) as scratch:
+        staged = Path(scratch)
+        ass_path = None
+        if settings.get("subtitles", True) and words:
+            text = subtitles.build_ass(
+                words, sub_start, sub_end,
+                hook=clip.get("hook") or clip.get("title") or "",
+                accent=settings.get("accent", "yellow"),
+                uppercase=settings.get("uppercase", True),
+                show_hook=settings.get("show_hook", True),
+                sub_size=int(settings.get("sub_size", 118)),
+                font=settings.get("sub_font", "montserrat"),
+                position=settings.get("sub_position", "bottom"),
+                offset=int(settings.get("sub_offset", 0)),
+                speed=settings.get("sub_speed", "calm"),
+            )
+            if panel_size:
+                panel_h = panel_size[1]
+                text = text.replace("PlayResY: 1920", f"PlayResY: {panel_h}")
+                text = re.sub(r"\\pos\(([^,]+),([0-9.]+)\)",
+                              lambda m: f"\\pos({m[1]},{float(m[2])*panel_h/1920:.1f})", text)
+            ass_path = staged / f"{clip['id']}.ass"
+            ass_path.write_text(text, encoding="utf-8")
+
+        encoded = staged / out_path.name
+        render.render_clip(
+            source, clip["start"], clip["end"], encoded, ass_path=ass_path,
+            aspect=settings.get("aspect", "9:16"), mode=mode,
+            focus_x=float(settings.get("focus_x", 0.5)), on_progress=on_progress,
+            crop_path=crop_path, pip=pip_options(opts or {}),
+            audio_track=audio_track, spans=spans or None, output_size=panel_size,
+        )
+
+        composition_info = None
+        if composition_conf:
+            from . import composition
+            composition_info = composition.apply(
+                encoded, composition_conf,
+                canvas=render.ASPECTS.get(settings.get("aspect", "9:16")),
+                main_prepared=bool(panel_size), variation=int(clip["idx"]))
+
+        thumb = preview = None
+        try:
+            thumb = render.make_thumb(encoded, staged / thumb_path.name,
+                                      at=min(1.2, max(0.2, (sub_end - sub_start) * 0.15)))
+            preview = render.make_preview(encoded, staged / "preview.mp4")
+        except (OSError, RuntimeError) as exc:
+            print(f"[render] не удалось собрать превью: {exc}", file=sys.stderr, flush=True)
+
+        encoded.replace(out_path)
+        current_thumb = None
+        for asset, target in ((ass_path, ass_dir / f"{clip['id']}.ass"),
+                              (thumb, thumb_path), (preview, preview_path)):
+            try:
+                if asset:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    asset.replace(target)
+                    if target == thumb_path:
+                        current_thumb = str(target)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"[render] не удалось обновить {target.name}: {exc}", file=sys.stderr, flush=True)
+
+    rendered_settings = {
+        **(clip.get("settings") or {}), **settings,
+        "audio_track": audio_track,
+        "rendered_spans": [
+            {**span, "start": round(span["start"] + timeline_offset, 3),
+             "end": round(span["end"] + timeline_offset, 3)}
+            for span in spans
+        ],
+    }
+    if composition_info is not None:
+        rendered_settings["composition_info"] = composition_info
+    db.update_clip(clip["id"], **(clip_updates or {}), settings=rendered_settings,
+                   status="ready", path=str(out_path), thumb=current_thumb, error=None)
 
 
 def rerender_clip(clip_id: str, payload: Dict[str, Any],
@@ -766,27 +842,56 @@ def rerender_clip(clip_id: str, payload: Dict[str, Any],
     if end - start < 3:
         raise RuntimeError("Клип слишком короткий")
     words = list(clip["words"] or [])
+    opts = normalize_options(project.get("options"))
     if not project.get("source"):
         from . import live
         # старые live-клипы хранили слова относительно окна эфира
         words = live._absolute_words(words, float(clip["start"]))
+    elif clip.get("path") or "audio_track" in payload:
+        source = Path(project["source"])
+        track_count = utils.probe(source)["audio_tracks"]
+        track = payload.get("audio_track", opts["audio_track"])
+        if "audio_track" in payload and track >= track_count:
+            raise ValueError("Выбранная аудиодорожка отсутствует в исходнике")
+        track = track if track < track_count else 0
+        opts["audio_track"] = track
+        # Старые клипы с несколькими дорожками не хранили, какую услышал Whisper.
+        previous_track = settings.get("audio_track", 0 if track_count < 2 else None)
+        if track_count and track != previous_track:
+            workdir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".asr-", dir=workdir) as scratch:
+                try:
+                    transcript = transcribe.transcribe(
+                        source, Path(scratch), language=opts["language"] or None,
+                        audio_track=track, window=(start, end),
+                    )
+                except transcribe.NoSpeechError:
+                    words = []
+                else:
+                    words = [
+                        {**word, "start": round(start + word["start"], 3),
+                         "end": round(start + word["end"], 3)}
+                        for segment in transcript["segments"] for word in segment["words"]
+                    ]
     if start != clip["start"] or end != clip["end"]:
         words = [w for w in words if float(w["end"]) > start and float(w["start"]) < end]
     # правка текста субтитров: сохраняем тайминги, меняем только слова
     if payload.get("text") is not None and str(payload.get("text")).strip():
         words = subtitles.retime_words(words, str(payload["text"]))
-    db.update_clip(clip_id, status="rendering", start=start, end=end, words=words,
-                   hook=payload.get("hook", clip["hook"]), title=payload.get("title", clip["title"]),
-                   caption=payload.get("caption", clip["caption"]),
-                   settings=settings, error=None)
-    updated = db.get_clip(clip_id)
+    updates = {
+        "start": start, "end": end, "words": words,
+        "hook": payload.get("hook", clip["hook"]),
+        "title": payload.get("title", clip["title"]),
+        "caption": payload.get("caption", clip["caption"]),
+    }
+    updated = {**clip, **updates}
     if project.get("source"):
-        _render_one(Path(project["source"]), workdir, updated, settings, on_progress,
-                    project.get("options") or {})
+        _render_one(Path(project["source"]), workdir, updated, settings, on_progress, opts,
+                    clip_updates=updates)
     else:
         from . import live
         # клип из прямого эфира: берём фрагмент из записанных сегментов
-        live._render_live_clip(workdir, updated, 0.0, settings, project.get("options") or {})
+        live._render_live_clip(workdir, updated, 0.0, settings, opts, clip_updates=updates)
     return db.get_clip(clip_id) or updated
 
 
@@ -837,10 +942,10 @@ def parse_timecode(value: str) -> Optional[float]:
 
 
 def trim_silence(source: Path, start: float, end: float,
-                 max_trim: float = 3.0) -> Tuple[float, float]:
+                 max_trim: float = 3.0, *, audio_track: Optional[int] = None) -> Tuple[float, float]:
     """Подтягивает края клипа к речи, чтобы не брать пустые секунды."""
     try:
-        curve, mean_db = analyze.cached_energy_curve(source)
+        curve, mean_db = analyze.cached_energy_curve(source, audio_track=audio_track)
         if not curve:
             return start, end
         new_start = analyze._nearest_quiet(curve, mean_db, start + 0.05, 0.25, window=0.35)
@@ -866,8 +971,9 @@ def add_manual_clip(pid: str, start: float, end: float,
     end = min(float(end), duration if duration else float(end))
     if end - start < 3:
         raise RuntimeError("Клип короче 3 секунд")
+    opts = normalize_options(project.get("options"))
     if trim:
-        start, end = trim_silence(source, start, end)
+        start, end = trim_silence(source, start, end, audio_track=opts["audio_track"])
     words: List[Dict[str, Any]] = []
     try:
         transcript = (project.get("meta") or {}).get("transcript")
@@ -881,7 +987,6 @@ def add_manual_clip(pid: str, start: float, end: float,
                     words.append(word)
     except Exception:  # noqa: BLE001
         words = []
-    opts = project.get("options") or {}
     settings = _clip_settings(opts)
     existing = db.list_clips(pid)
     idx = max([int(c["idx"]) for c in existing], default=-1) + 1

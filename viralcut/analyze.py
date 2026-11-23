@@ -279,12 +279,13 @@ def build_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sentences
 
 
-def energy_curve(media: Path, hop: float = 0.25) -> Tuple[List[float], float]:
+def energy_curve(media: Path, hop: float = 0.25, *,
+                 audio_track: Optional[int] = None) -> Tuple[List[float], float]:
     """RMS-громкость по кадрам (дБ) и средний уровень."""
     try:
         import numpy as np
 
-        audio = utils.read_audio_mono(media)
+        audio = utils.read_audio_mono(media, audio_track=audio_track)
         sr = 16000
         n = max(1, int(hop * sr))
         frames = len(audio) // n
@@ -300,23 +301,24 @@ def energy_curve(media: Path, hop: float = 0.25) -> Tuple[List[float], float]:
 
 # Кривая громкости нужна и поиску моментов, и вырезанию пауз, и подтяжке краёв.
 # Без кэша один и тот же исходник декодировался по разу на каждый клип.
-_ENERGY_CACHE: Dict[Tuple[str, float, int, float], Tuple[List[float], float]] = {}
+_ENERGY_CACHE: Dict[Tuple[str, int, int, float, Optional[int]], Tuple[List[float], float]] = {}
 _ENERGY_LOCK = threading.Lock()
 _ENERGY_CACHE_MAX = 4
 
 
-def cached_energy_curve(media: Path, hop: float = 0.25) -> Tuple[List[float], float]:
-    """energy_curve с кэшем по файлу (путь + mtime + размер)."""
+def cached_energy_curve(media: Path, hop: float = 0.25, *,
+                        audio_track: Optional[int] = None) -> Tuple[List[float], float]:
+    """Кривая громкости для конкретного файла и аудиодорожки."""
     try:
         stat = Path(media).stat()
-        key = (str(Path(media).resolve()), round(stat.st_mtime, 3), int(stat.st_size), hop)
+        key = (str(Path(media).resolve()), stat.st_mtime_ns, stat.st_size, hop, audio_track)
     except OSError:
-        return energy_curve(media, hop)
+        return energy_curve(media, hop, audio_track=audio_track)
     with _ENERGY_LOCK:
         hit = _ENERGY_CACHE.get(key)
     if hit is not None:
         return hit[0], hit[1]
-    value = energy_curve(media, hop)
+    value = energy_curve(media, hop, audio_track=audio_track)
     with _ENERGY_LOCK:
         if len(_ENERGY_CACHE) >= _ENERGY_CACHE_MAX:
             _ENERGY_CACHE.clear()
@@ -528,18 +530,19 @@ def _make_caption(title: str, text: str, platform: str) -> str:
 
 def find_segments(segments: List[Dict[str, Any]], media: Path, duration: float,
                   count: int = 10, min_dur: float = 15, max_dur: float = 60,
-                  target_dur: float = 32, platform: str = "shorts") -> List[Dict[str, Any]]:
+                  target_dur: float = 32, platform: str = "shorts", *,
+                  audio_track: Optional[int] = None) -> List[Dict[str, Any]]:
     """Возвращает список клипов: тайминги, score, заголовок, объяснение."""
     sents = build_sentences(segments)
     if not sents:
         return []
-    curve, mean_db = cached_energy_curve(media)
+    curve, mean_db = cached_energy_curve(media, audio_track=audio_track)
     hop = 0.25
     ad_blocks = detect_ads(sents)
     # Смех/аплодисменты и смены сцен — необязательные сигналы: без numpy,
     # OpenCV или звука поиск моментов продолжает работать по тексту и громкости.
     try:
-        reactions: Optional[Dict[str, List[Dict[str, float]]]] = audio_reactions(media)
+        reactions: Optional[Dict[str, List[Dict[str, float]]]] = audio_reactions(media, audio_track=audio_track)
     except Exception:  # noqa: BLE001
         reactions = None
     try:
@@ -763,17 +766,18 @@ def cut_plan(start: float, end: float, gaps: List[Dict[str, float]],
 def remap_words(words: List[Dict[str, Any]], spans: List[Dict[str, float]]
                 ) -> List[Dict[str, Any]]:
     """Слова под склейку: выбросить попавшие в паузы, сдвинуть на новое время."""
-    out: List[Dict[str, Any]] = []
+    out: Dict[int, Dict[str, Any]] = {}
     for span in spans:
         shift = float(span["output"]) - float(span["start"])
-        for word in words:
-            w_start, w_end = float(word["start"]), float(word["end"])
-            if w_end <= span["start"] or w_start >= span["end"]:
+        for index, word in enumerate(words):
+            start = max(float(word["start"]), span["start"])
+            end = min(float(word["end"]), span["end"])
+            if end <= start:
                 continue
-            out.append({**word,
-                        "start": round(max(0.0, w_start - span["start"]) + span["output"], 3),
-                        "end": round(max(0.0, w_end - span["start"]) + span["output"], 3)})
-    return out
+            if index not in out:
+                out[index] = {**word, "start": round(start + shift, 3)}
+            out[index]["end"] = round(end + shift, 3)
+    return list(out.values())
 
 
 # --- Реакции аудитории и смены сцен -----------------------------------------
@@ -940,11 +944,11 @@ def _reaction_segments(features: Dict[str, Any], kind: str) -> List[Dict[str, fl
     return [seg for seg in merged if seg["end"] - seg["start"] >= min_len]
 
 
-def audio_reactions(media: Path) -> Dict[str, List[Dict[str, float]]]:
+def audio_reactions(media: Path, *, audio_track: Optional[int] = None) -> Dict[str, List[Dict[str, float]]]:
     """Смех и аплодисменты в дорожке: отрезки {start, end, score}."""
     empty: Dict[str, List[Dict[str, float]]] = {"laughter": [], "applause": []}
     try:
-        audio = utils.read_audio_mono(Path(media), _SR)
+        audio = utils.read_audio_mono(Path(media), _SR, audio_track=audio_track)
     except Exception:  # noqa: BLE001 — нет звука/файла: реакций просто нет
         return empty
     features = _frame_features(audio)

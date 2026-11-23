@@ -5,14 +5,15 @@
 
 macOS: CPU — счётчики ядра через mach host_statistics, память — vm_stat,
 видеокарта — ioreg (Device Utilization %).
-Windows: CPU — GetSystemTimes, память — GlobalMemoryStatusEx, GPU — nvidia-smi,
-если он есть (иначе «н/д»).
+Windows: CPU — GetSystemTimes, память — GlobalMemoryStatusEx, GPU — PDH
+со счётчиками отдельных движков, с резервными источниками для NVIDIA и AMD.
 Linux: /proc/stat и /proc/meminfo, GPU — nvidia-smi.
 """
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import math
 import os
 import re
 import subprocess
@@ -224,49 +225,40 @@ def _memory_uncached() -> Dict[str, Any]:
 
 # --- Видеокарта ---------------------------------------------------------------
 
-# Счётчики PDH: раскрытие масок и чтение значений идут через pdh.dll.
+# Счётчики PDH читаются через pdh.dll.
 # Важно: без argtypes/restype ctypes на 64-битной Windows обрезает HANDLE до
 # 32 бит — PdhCloseQuery получает мусорный указатель и процесс падает прямо во
 # время опроса (симптом: «нажал Пересобрать — приложение закрылось без лога»).
 _ENGINE_RE = re.compile(
-    r"luid_(0x[0-9A-Fa-f]+)_(0x[0-9A-Fa-f]+)_phys_(\d+)_(?:eng_(\d+)_)?engtype_([A-Za-z0-9]+)")
+    r"(luid_0x[0-9a-f]+_0x[0-9a-f]+_phys_\d+)_eng_(\d+)_engtype_[a-z0-9]+",
+    re.IGNORECASE,
+)
 _PDH_LOCK = threading.Lock()
 _PDH_DLL: List[Any] = [None]
 _PDH_VALUE: List[Any] = [None]
 
 
-def _engine_key(counter_path: str) -> Tuple[str, str]:
-    """(адаптер, тип движка) из пути счётчика «GPU Engine»."""
-    match = _ENGINE_RE.search(counter_path or "")
-    if not match:
-        return "", ""
-    adapter = f"{match.group(1)}:{match.group(2)}:phys_{match.group(3)}"
-    return adapter, match.group(5).lower()
-
-
 def _summarize_engine_utilization(samples: List[Tuple[str, float]]) -> Dict[str, Any]:
-    """Суммирует 3D-движки по адаптеру и берёт самый занятый адаптер.
+    """Суммирует процессы на каждом физическом движке и берёт максимум.
 
     Windows отдаёт по экземпляру счётчика на каждый процесс и каждый движок.
-    Складывать все движки (как было раньше) — неверно: кодировщик видео и
-    копирование прибавлялись к 3D и цифра улетала в 100% на пустой карте.
+    Video Encode, 3D и другие движки могут работать одновременно, поэтому их
+    проценты учитываются отдельно. Нулевой замер означает простой.
     """
-    per_adapter: Dict[str, float] = {}
-    for path, value in samples:
-        adapter, engine = _engine_key(path)
-        if not adapter or not engine.startswith("3d"):
+    per_engine: Dict[Tuple[str, str], float] = {}
+    for name, value in samples:
+        match = _ENGINE_RE.search(name)
+        if not match:
             continue
-        try:
-            amount = float(value)
-        except (TypeError, ValueError):
+        if not math.isfinite(value) or value < 0:
             continue
-        if amount <= 0:
-            continue
-        per_adapter[adapter] = per_adapter.get(adapter, 0.0) + amount
-    if not per_adapter:
+        key = (match[1].lower(), match[2])
+        per_engine[key] = per_engine.get(key, 0.0) + value
+    if not per_engine:
         return {"percent": None, "adapters": 0}
-    busiest = max(per_adapter.values())
-    return {"percent": int(round(min(100.0, busiest))), "adapters": len(per_adapter)}
+    busiest = max(per_engine.values())
+    return {"percent": int(round(min(100.0, busiest))),
+            "adapters": len({adapter for adapter, _ in per_engine})}
 
 
 def _pdh():
@@ -287,22 +279,22 @@ def _pdh():
             _anonymous_ = ("value",)
             _fields_ = [("CStatus", wt.DWORD), ("value", _Value)]
 
-        _PDH_VALUE[0] = PDH_FMT_COUNTERVALUE
+        class PDH_FMT_COUNTERVALUE_ITEM_W(ctypes.Structure):
+            _fields_ = [("szName", wt.LPWSTR), ("FmtValue", PDH_FMT_COUNTERVALUE)]
+
+        _PDH_VALUE[0] = PDH_FMT_COUNTERVALUE_ITEM_W
         pdh.PdhOpenQueryW.argtypes = [wt.LPCWSTR, ctypes.c_size_t,
                                       ctypes.POINTER(wt.HANDLE)]
         pdh.PdhOpenQueryW.restype = wt.LONG
-        pdh.PdhExpandWildCardPathW.argtypes = [wt.LPCWSTR, wt.LPCWSTR, wt.LPWSTR,
-                                               ctypes.POINTER(wt.DWORD), wt.DWORD]
-        pdh.PdhExpandWildCardPathW.restype = wt.LONG
-        pdh.PdhAddCounterW.argtypes = [wt.HANDLE, wt.LPCWSTR, ctypes.c_size_t,
-                                       ctypes.POINTER(wt.HANDLE)]
-        pdh.PdhAddCounterW.restype = wt.LONG
+        pdh.PdhAddEnglishCounterW.argtypes = [wt.HANDLE, wt.LPCWSTR, ctypes.c_size_t,
+                                              ctypes.POINTER(wt.HANDLE)]
+        pdh.PdhAddEnglishCounterW.restype = wt.LONG
         pdh.PdhCollectQueryData.argtypes = [wt.HANDLE]
         pdh.PdhCollectQueryData.restype = wt.LONG
-        pdh.PdhGetFormattedCounterValue.argtypes = [
+        pdh.PdhGetFormattedCounterArrayW.argtypes = [
             wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.DWORD),
-            ctypes.POINTER(PDH_FMT_COUNTERVALUE)]
-        pdh.PdhGetFormattedCounterValue.restype = wt.LONG
+            ctypes.POINTER(wt.DWORD), ctypes.POINTER(PDH_FMT_COUNTERVALUE_ITEM_W)]
+        pdh.PdhGetFormattedCounterArrayW.restype = wt.LONG
         pdh.PdhCloseQuery.argtypes = [wt.HANDLE]
         pdh.PdhCloseQuery.restype = wt.LONG
     except Exception:  # noqa: BLE001 — не Windows или pdh.dll недоступна
@@ -323,33 +315,19 @@ def _gpu_windows_pdh() -> Dict[str, Any]:
         from ctypes import wintypes as wt
     except Exception:  # noqa: BLE001
         return {"percent": None, "name": ""}
-    pdh = _pdh()
-    if pdh is None:
-        return {"percent": None, "name": ""}
-
     with _PDH_LOCK:
+        pdh = _pdh()
+        if pdh is None:
+            return {"percent": None, "name": ""}
         query = wt.HANDLE()
         if pdh.PdhOpenQueryW(None, ctypes.c_size_t(0), ctypes.byref(query)) != 0:
             return {"percent": None, "name": ""}
         try:
-            path = "\\GPU Engine(*)\\Utilization Percentage"
-            size = wt.DWORD(0)
-            pdh.PdhExpandWildCardPathW(None, path, None, ctypes.byref(size), wt.DWORD(0))
-            if size.value <= 0:
-                return {"percent": None, "name": ""}
-            buf = ctypes.create_unicode_buffer(size.value + 2)
-            if pdh.PdhExpandWildCardPathW(None, path, buf, ctypes.byref(size),
-                                          wt.DWORD(0)) != 0:
-                return {"percent": None, "name": ""}
-            counters: List[Tuple[str, Any]] = []
-            for counter_path in buf[:size.value].split("\0"):
-                if not counter_path or "engtype_3d" not in counter_path.lower():
-                    continue
-                handle = wt.HANDLE()
-                if pdh.PdhAddCounterW(query, counter_path, ctypes.c_size_t(0),
-                                      ctypes.byref(handle)) == 0:
-                    counters.append((counter_path, handle))
-            if not counters:
+            counter = wt.HANDLE()
+            # EnglishCounter переводит путь в системную локаль, сохраняя
+            # маску экземпляров для чтения массива через PDH.
+            if pdh.PdhAddEnglishCounterW(query, r"\GPU Engine(*)\Utilization Percentage",
+                                         0, ctypes.byref(counter)) != 0:
                 return {"percent": None, "name": ""}
 
             if pdh.PdhCollectQueryData(query) != 0:
@@ -358,16 +336,21 @@ def _gpu_windows_pdh() -> Dict[str, Any]:
             if pdh.PdhCollectQueryData(query) != 0:
                 return {"percent": None, "name": ""}
 
-            samples: List[Tuple[str, float]] = []
             PDH_FMT_DOUBLE = 0x00000200
-            for counter_path, handle in counters:
-                value = _PDH_VALUE[0]()
-                counter_type = wt.DWORD(0)
-                status = pdh.PdhGetFormattedCounterValue(
-                    handle, PDH_FMT_DOUBLE, ctypes.byref(counter_type), ctypes.byref(value))
-                # PDH_CSTATUS_VALID_DATA (0) / PDH_CSTATUS_NEW_DATA (1)
-                if status == 0 and value.CStatus in (0, 1):
-                    samples.append((counter_path, value.doubleValue))
+            size = wt.DWORD(0)
+            count = wt.DWORD(0)
+            get_values = pdh.PdhGetFormattedCounterArrayW
+            PDH_MORE_DATA = 0x800007D2
+            status = get_values(counter, PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count), None)
+            if (status & 0xFFFFFFFF) != PDH_MORE_DATA or not size.value:
+                return {"percent": None, "name": ""}
+            buffer = ctypes.create_string_buffer(size.value)
+            items = ctypes.cast(buffer, ctypes.POINTER(_PDH_VALUE[0]))
+            if get_values(counter, PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count), items) != 0:
+                return {"percent": None, "name": ""}
+            samples = [(items[i].szName, items[i].FmtValue.doubleValue)
+                       for i in range(count.value)
+                       if items[i].szName and items[i].FmtValue.CStatus in (0, 1)]
             summary = _summarize_engine_utilization(samples)
             if summary.get("percent") is None:
                 return {"percent": None, "name": ""}
@@ -595,7 +578,7 @@ def _gpu_nvidia() -> Dict[str, Any]:
 
 
 def gpu(force: bool = False) -> Dict[str, Any]:
-    """Видеокарта с кэшем на 1.5 с: на Windows каждый вызов — это nvidia-smi."""
+    """Видеокарта с коротким кэшем между опросами виджета."""
     now = time.monotonic()
     if not force and _GPU_CACHE.get("value") and now - _GPU_CACHE.get("ts", 0.0) < 1.5:
         return dict(_GPU_CACHE["value"])

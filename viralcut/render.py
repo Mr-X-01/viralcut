@@ -7,9 +7,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from .config import ffmpeg
 from . import custom_fonts, resources
@@ -118,6 +120,11 @@ def _audio_spans_graph(segments: List[Dict[str, float]], base: float,
 
 
 _HW_CACHE: Dict[str, Any] = {}
+_HW_LOCK = threading.Lock()
+_FALLBACK_LOCK = threading.Lock()
+_FALLBACK_NOTICE_SECONDS = 30
+_fallback_notice: Optional[Dict[str, str]] = None
+_last_fallback = 0.0
 
 
 def _hw_args(encoder: str, crf: int) -> List[str]:
@@ -157,6 +164,9 @@ def _hw_works(encoder: str) -> bool:
     try:
         proc = run(cmd, timeout=15)
         ok = proc.returncode == 0
+        if not ok and sys.platform == "win32":
+            detail = (proc.stderr or proc.stdout or "").strip()
+            print(f"[render] проба {encoder}: {detail[-460:]}", file=sys.stderr, flush=True)
     except Exception:  # noqa: BLE001 — таймаут/падение трактуем как «не работает»
         ok = False
     _HW_CACHE[key] = ok
@@ -177,33 +187,79 @@ def hw_cached() -> Optional[str]:
     return _HW_CACHE.get("value")
 
 
-def hw_encoder() -> Optional[str]:
-    """Аппаратный энкодер для быстрого рендера: videotoolbox / nvenc / qsv.
-
-    Возвращает имя только если ffmpeg его знает И железо отвечает на пробном
-    кадре. При любой ошибке рендер один раз повторится на libx264.
-    """
-    if "value" in _HW_CACHE:
-        return _HW_CACHE["value"]
-    mode = _encoder_mode()
-    if mode == "cpu":
-        # пользователь выбрал процессор — GPU не трогаем вовсе
-        _HW_CACHE["value"] = None
-        return None
+def _find_hw_encoder(excluded: Tuple[str, ...] = ()) -> Optional[str]:
+    """Ищет рабочий кодировщик. Вызывается под _HW_LOCK."""
     preferred = {"darwin": ["h264_videotoolbox"],
                  "win32": ["h264_nvenc", "h264_amf", "h264_qsv"],
                  "linux": ["h264_nvenc", "h264_vaapi", "h264_qsv"]}.get(sys.platform, [])
-    try:
-        proc = run([ffmpeg(), "-hide_banner", "-encoders"])
-        text = (proc.stdout or "") + (proc.stderr or "")
-    except Exception:
-        text = ""
-    found = next((name for name in preferred if name in text and _hw_works(name)), None)
-    if mode == "gpu" and not found:
-        print("[render] выбран GPU, но аппаратный энкодер недоступен — остаюсь на CPU",
-              file=sys.stderr, flush=True)
-    _HW_CACHE["value"] = found
-    return found
+    if "encoders" not in _HW_CACHE:
+        try:
+            proc = run([ffmpeg(), "-hide_banner", "-encoders"])
+            _HW_CACHE["encoders"] = (proc.stdout or "") + (proc.stderr or "")
+        except Exception:
+            _HW_CACHE["encoders"] = ""
+    available = _HW_CACHE["encoders"]
+    return next((name for name in preferred
+                 if name not in excluded and name in available and _hw_works(name)), None)
+
+
+def reset_hw_encoder() -> None:
+    """Позволяет повторить пробу после сохранения настроек."""
+    with _HW_LOCK:
+        _HW_CACHE.clear()
+
+
+def hw_encoder(mode: Optional[str] = None) -> Optional[str]:
+    """Возвращает аппаратный энкодер после успешной пробы FFmpeg."""
+    with _HW_LOCK:
+        mode = mode or _encoder_mode()
+        if mode == "cpu":
+            return None
+        if "value" not in _HW_CACHE:
+            _HW_CACHE["value"] = _find_hw_encoder()
+        return _HW_CACHE["value"]
+
+
+def cpu_fallback_notice() -> Optional[Dict[str, str]]:
+    """Последний переход на CPU для опроса интерфейса."""
+    with _FALLBACK_LOCK:
+        if _fallback_notice and time.monotonic() - _last_fallback < _FALLBACK_NOTICE_SECONDS:
+            return dict(_fallback_notice)
+    return None
+
+
+def _announce_cpu_fallback(hw: Optional[str]) -> None:
+    global _fallback_notice, _last_fallback
+    reason = "gpu_failed" if hw else "gpu_unavailable"
+    detail = f"{hw} и другие доступные GPU не отрендерили клип" if hw else "аппаратный энкодер недоступен"
+    print(f"[render] {detail}. Рендер на процессоре (libx264)", file=sys.stderr, flush=True)
+    with _FALLBACK_LOCK:
+        now = time.monotonic()
+        if (_fallback_notice is None or _fallback_notice["reason"] != reason
+                or now - _last_fallback >= _FALLBACK_NOTICE_SECONDS):
+            _fallback_notice = {"id": str(time.monotonic_ns()), "reason": reason}
+        _last_fallback = now
+
+
+def _encode_attempts(
+    hw: Optional[str], crop_path: Optional[Dict[str, Any]], try_other_gpu: bool,
+) -> Iterator[Tuple[Optional[str], Optional[Dict[str, Any]]]]:
+    if hw:
+        yield hw, crop_path
+        if try_other_gpu:
+            tried = [hw]
+            while True:
+                with _HW_LOCK:
+                    alternative = _find_hw_encoder(tuple(tried))
+                if alternative is None:
+                    break
+                tried.append(alternative)
+                yield alternative, crop_path
+    yield None, crop_path
+    if crop_path:
+        # Если длинное выражение кадрирования отвергнуто, пробуем упрощённое.
+        yield None, _reframe._coarse_path(crop_path)
+        yield None, None
 
 
 def _video_args(encoder: Optional[str], crf: int, preset: str) -> List[str]:
@@ -253,7 +309,7 @@ def _run_encode(cmd: List[str], duration: float,
                     done = int(line.split("=", 1)[1]) / 1_000_000
                 except ValueError:
                     continue
-                on_progress(round(min(0.99, done / duration), 3))
+                on_progress(round(max(0.0, min(0.99, done / duration)), 3))
         proc.wait()
     finally:
         timer.cancel()
@@ -409,7 +465,7 @@ def render_clip(source: Path, clip_start: float, clip_end: float, out_path: Path
         fade_out = max(0.0, duration - 0.06)
         return text + f",afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out:.3f}:d=0.05"
 
-    def _compose(video_args: List[str], filters: str) -> List[str]:
+    def _compose(video_args: List[str], filters: str, output: Path) -> List[str]:
         """Собирает команду целиком: так откат на другой энкодер — это пересборка."""
         threads = str(resources.ffmpeg_threads())
         built = resources.wrap_nice([ffmpeg(), "-y", "-hide_banner", "-v", "error", "-nostats",
@@ -435,51 +491,54 @@ def render_clip(source: Path, clip_start: float, clip_end: float, out_path: Path
         else:
             built += ["-an"]
         built += ["-threads", str(resources.ffmpeg_threads())] + video_args + [
-            "-r", "30", "-movflags", "+faststart", "-shortest", str(out_path)]
+            "-r", "30", "-movflags", "+faststart", "-shortest", str(output)]
         return built
 
-    hw = hw_encoder()
-    attempts: List[Tuple[Optional[str], Optional[Dict[str, Any]]]] = []
-    if hw:
-        attempts.append((hw, crop_path))
-    attempts.append((None, crop_path))
-    if crop_path:
-        # если ffmpeg не переварил длинное выражение кадрирования — грубый путь
-        attempts.append((None, _reframe._coarse_path(crop_path)))
-        attempts.append((None, None))
+    encoder_mode = _encoder_mode()
+    windows_gpu = sys.platform == "win32" and encoder_mode == "gpu"
+    hw = hw_encoder(encoder_mode)
+    attempts = _encode_attempts(hw, crop_path, windows_gpu)
+    tried_cpu = False
     tail_text = ""
     stop_reason: Optional[str] = None
     code = 1
-    for attempt, (encoder, path_used) in enumerate(attempts):
-        out_path.unlink(missing_ok=True)
-        filters = _build_filters(path_used if mode == "auto" else None)
-        cmd = _compose(_video_args(encoder, crf, preset), filters)
-        if os.environ.get("VIRALCUT_DEBUG_RENDER"):
-            print("[render] cmd:", " ".join(cmd), file=sys.stderr, flush=True)
-        code, tail, stop_reason = _run_encode(cmd, duration, on_progress if attempt == 0 else None)
-        tail_text = "".join(tail)
+    # Все попытки пишут рядом с готовым файлом. При сбое старый MP4 остаётся доступен.
+    with tempfile.TemporaryDirectory(prefix=".render-", dir=out_path.parent) as scratch:
+        staged = Path(scratch) / out_path.name
+        for attempt, (encoder, path_used) in enumerate(attempts):
+            if encoder is None and not tried_cpu:
+                if windows_gpu:
+                    _announce_cpu_fallback(hw)
+                elif hw:
+                    print(f"[render] {hw} не сработал, повтор на libx264", file=sys.stderr, flush=True)
+                tried_cpu = True
+            staged.unlink(missing_ok=True)
+            filters = _build_filters(path_used if mode == "auto" else None)
+            cmd = _compose(_video_args(encoder, crf, preset), filters, staged)
+            if os.environ.get("VIRALCUT_DEBUG_RENDER"):
+                print("[render] cmd:", " ".join(cmd), file=sys.stderr, flush=True)
+            code, tail, stop_reason = _run_encode(cmd, duration, on_progress if attempt == 0 else None)
+            tail_text = "".join(tail)
+            if stop_reason and not (windows_gpu and encoder):
+                break
+            if not stop_reason and code == 0 and staged.is_file() and staged.stat().st_size >= 10000:
+                if on_progress:
+                    on_progress(1.0)
+                staged.replace(out_path)
+                break
+            if encoder is not None and windows_gpu:
+                detail = stop_reason or tail_text.strip() or f"код {code}, выходной MP4 неполный"
+                print(f"[render] {encoder}: {detail[-460:]}", file=sys.stderr, flush=True)
+            elif encoder is None and path_used is not None:
+                print("[render] выражение кадрирования отвергнуто, повторю с упрощённым путём",
+                      file=sys.stderr, flush=True)
+        else:
+            hint = ""
+            if hw and "libx264" not in tail_text:
+                hint = " Попробуйте отключить аппаратный энкодер: VIRALCUT_HW_ENCODE=0."
+            raise MediaError("Не удалось отрендерить клип: " + tail_text[-600:] + hint)
         if stop_reason:
-            break
-        if code == 0 and out_path.exists() and out_path.stat().st_size >= 10000:
-            break
-        if encoder is not None:
-            # железо не справилось — повторяем на CPU, не ломая команду
-            print(f"[render] {encoder} не сработал, повтор на libx264", file=sys.stderr, flush=True)
-        elif path_used is not None:
-            print("[render] выражение кадрирования отвергнуто, повторю с упрощённым путём",
-                  file=sys.stderr, flush=True)
-
-    if stop_reason:
-        out_path.unlink(missing_ok=True)
-        raise MediaError(f"Рендер остановлен: {stop_reason}. Попробуйте ещё раз.")
-    if code != 0 or not out_path.exists() or out_path.stat().st_size < 10000:
-        hint = ""
-        if hw and "libx264" not in tail_text:
-            hint = " Попробуйте отключить аппаратный энкодер: VIRALCUT_HW_ENCODE=0."
-        raise MediaError("Не удалось отрендерить клип: " + tail_text[-600:] + hint)
-
-    if on_progress:
-        on_progress(1.0)
+            raise MediaError(f"Рендер остановлен: {stop_reason}. Попробуйте ещё раз.")
     return {"path": out_path, "duration": round(duration, 2), "width": w, "height": h}
 
 

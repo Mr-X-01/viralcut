@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Dict
 
 from . import db, live, pipeline
@@ -12,6 +14,7 @@ from .config import MAX_WORKERS
 _project_pool = ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS), thread_name_prefix="project")
 _clip_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="clip")
 _lock = threading.Lock()
+_clip_running: set[str] = set()
 
 # Каждый эфир — отдельный поток. Раньше стримы шли через пул на 3 места, и
 # несколько «ждущих эфир» записей навсегда занимали очередь: следующая запись
@@ -106,20 +109,29 @@ def submit_process(pid: str) -> None:
     _guarded(pid, lambda: pipeline.process_project(pid))
 
 
-def submit_rerender(clip_id: str, payload: Dict[str, Any]) -> None:
-    clip = db.get_clip(clip_id)
-    if not clip:
-        return
-    pid = clip["project_id"]
+def submit_rerender(clip_id: str, payload: Dict[str, Any]) -> bool:
+    with _lock:
+        if clip_id in _clip_running:
+            return False
+        previous = db.get_clip(clip_id)
+        if not previous:
+            return False
+        db.update_clip(clip_id, status="rendering", error=None)
+        _clip_running.add(clip_id)
+    pid = previous["project_id"]
     _mark(pid, 1)
-    db.update_clip(clip_id, status="rendering", error=None)
 
     def work() -> None:
         try:
             pipeline.rerender_clip(clip_id, payload)
         except Exception as exc:  # noqa: BLE001
-            db.update_clip(clip_id, status="error", error=str(exc)[:500])
+            previous_ready = (previous["status"] == "ready" and previous.get("path")
+                              and Path(previous["path"]).is_file())
+            db.update_clip(clip_id, status="ready" if previous_ready else "error", error=str(exc)[:500])
+            print(f"[render] пересборка клипа {clip_id}: {exc}", file=sys.stderr, flush=True)
         finally:
+            with _lock:
+                _clip_running.discard(clip_id)
             _mark(pid, -1)
             clips = db.list_clips(pid)
             if clips and is_running(pid):
@@ -130,3 +142,4 @@ def submit_rerender(clip_id: str, payload: Dict[str, Any]) -> None:
                 db.update_project(pid, status="ready", stage="Готово" if not failures else "Готово с ошибками", progress=1)
 
     _clip_pool.submit(work)
+    return True
