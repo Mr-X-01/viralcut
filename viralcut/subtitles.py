@@ -206,8 +206,38 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Запас по ширине: если libass не найдёт наш шрифт и подставит системный,
+# он обычно шире на 15–20%, и без запаса строки вылезали за кадр.
+_WIDTH_RESERVE = 1.15
+# Оценка ширины для авто-уменьшения: системный шрифт-замена шире нашего на
+# 15–20%, поэтому считаем с запасом — иначе уменьшение просто не срабатывало.
+_SHRINK_RESERVE = 1.18
+
+
+def _char_advance(font: Dict[str, Any], size: int) -> float:
+    """Средняя ширина символа в пикселях для этого шрифта и размера."""
+    return max(0.3, float(font["avg"])) * max(20, size) * _WIDTH_FACTOR
+
+
+def _fit_horizontal(font: Dict[str, Any], size: int, lines: List[str]) -> float:
+    """Fit residual overflow, measuring the actual glyphs when the TTF is available."""
+    from PIL import ImageFont
+    from . import custom_fonts
+    from .config import FONTS_DIR
+
+    path = (custom_fonts.CUSTOM_DIR if font.get("custom") else FONTS_DIR) / font["file"]
+    try:
+        face = ImageFont.truetype(str(path), size)
+        measured = max((face.getlength(line) for line in lines), default=0)
+    except (OSError, ValueError):
+        measured = max(map(len, lines), default=0) * size * 1.2
+    estimate = max(map(len, lines), default=0) * _char_advance(font, size)
+    width = (max(measured, estimate) + 16) * _SHRINK_RESERVE * 1.04
+    return min(100.0, int(10000 * _SAFE_WIDTH / max(1, width)) / 100)
+
+
 def _chars_per_line(font: Dict[str, Any], size: int) -> int:
-    advance = max(0.3, float(font["avg"])) * max(20, size) * _WIDTH_FACTOR
+    advance = _char_advance(font, size) * _WIDTH_RESERVE
     return max(8, min(24, int(_SAFE_WIDTH / advance)))
 
 
@@ -436,12 +466,22 @@ def build_ass(words: List[Dict[str, Any]], clip_start: float, clip_end: float,
             hook_text = hook_text[:49].rsplit(" ", 1)[0].rstrip(" ,.-—") + "…"
         hook_lines = _wrap(hook_text, max(10, int(chars * 1.15)), 3)
         body = "\\N".join(hook_lines)
+        # Хук тоже не должен вылезать за кадр при широком подставленном шрифте.
+        hook_widest = max((len(line) for line in hook_lines), default=0) * _char_advance(
+            info, hook_size_eff)
+        hook_shrink = 1.0
+        if hook_widest > _SAFE_WIDTH:
+            hook_shrink = max(0.6, _SAFE_WIDTH / (hook_widest * _SHRINK_RESERVE))
+        hook_size_tag = (f"\\fs{max(30, int(round(hook_size_eff * hook_shrink)))}"
+                         if hook_shrink < 0.995 else "")
+        hook_actual_size = max(30, int(round(hook_size_eff * hook_shrink)))
+        hook_x = _fit_horizontal(info, hook_actual_size, hook_lines)
         start, end = 0.15, min(clip_len - 0.1, max(1.8, min(4.2, clip_len * 0.3)))
         # если субтитры сверху — хук уводим вниз, чтобы не перекрывались
         hook_pos = "\\an2\\pos(540,1700)" if position == "top" else "\\an8\\pos(540,240)"
         events.append(
             f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Hook,,0,0,0,,"
-            f"{{{hook_pos}\\fad(180,220)\\fscx104\\fscy104}}"
+            f"{{{hook_pos}\\fad(180,220){hook_size_tag}\\fscx{hook_x * 1.04:.2f}\\fscy104}}"
             f"{body}"
         )
 
@@ -463,15 +503,17 @@ def build_ass(words: List[Dict[str, Any]], clip_start: float, clip_end: float,
         line_groups = [[i for i in range(len(tokens))]]
         total_len = sum(len(t) + 1 for t in tokens) - 1
         if total_len > chars and len(tokens) > 1:
-            best, best_diff = None, 1e9
+            # Переносим всегда, когда текст не влезает в одну строку: раньше при
+            # неудачном подборе вся реплика оставалась одной длинной строкой и
+            # уезжала за края кадра. Теперь выбираем разбиение с самой короткой
+            # «длинной» строкой.
+            best, best_score = None, None
             for split in range(1, len(tokens)):
                 left = " ".join(tokens[:split])
                 right = " ".join(tokens[split:])
-                if len(left) > chars + 2 or len(right) > chars + 2:
-                    continue
-                diff = abs(len(left) - len(right))
-                if diff < best_diff:
-                    best, best_diff = split, diff
+                score = (max(len(left), len(right)), abs(len(left) - len(right)))
+                if best_score is None or score < best_score:
+                    best, best_score = split, score
             if best:
                 line_groups = [list(range(best)), list(range(best, len(tokens)))]
 
@@ -487,9 +529,25 @@ def build_ass(words: List[Dict[str, Any]], clip_start: float, clip_end: float,
                 f"{{\\k{karaoke[ti]}}}{tokens[ti]}" for ti in group
             ))
         body = "\\N".join(rendered)
+        # Если строка шире безопасной области (длинное слово или подставленный
+        # системный шрифт), уменьшаем кегль этой реплики: текст остаётся в кадре.
+        advance = _char_advance(info, size)
+        widest = max((len(" ".join(tokens[i] for i in group)) for group in line_groups),
+                     default=0)
+        width_px = widest * advance
+        # Длинное слово перенести нельзя: его строка почти наверняка вылезет за
+        # края, если libass подставит более широкий системный шрифт.
+        longest_word = max((len(token) for token in tokens), default=0)
+        shrink = 1.0
+        if width_px > _SAFE_WIDTH or longest_word > chars:
+            shrink = max(0.6, _SAFE_WIDTH / (width_px * _SHRINK_RESERVE))
+        size_tag = f"\\fs{max(40, int(round(size * shrink)))}" if shrink < 0.995 else ""
+        actual_size = max(40, int(round(size * shrink)))
+        scale_x = _fit_horizontal(info, actual_size, [" ".join(tokens[i] for i in group) for group in line_groups])
         fade_limit = max(0, round((cue_end - cue_start) * 200))
         tags = (f"\\fad({min(fade_in, fade_limit)},{min(fade_out, fade_limit)})"
-                f"\\fscx104\\fscy104\\t(0,170,\\fscx100\\fscy100)")
+                f"{size_tag}"
+                f"\\fscx{scale_x * 1.04:.2f}\\fscy104\\t(0,170,\\fscx{scale_x:.2f}\\fscy100)")
         events.append(
             f"Dialogue: 0,{ass_time(cue_start)},{ass_time(cue_end)},Sub,,0,0,0,,"
             f"{{{pos}{tags}}}{body}"

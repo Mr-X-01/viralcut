@@ -22,6 +22,27 @@ from .utils import MediaError, probe, run, subprocess_kwargs
 ASPECTS = {"9:16": (1080, 1920), "1:1": (1080, 1080), "16:9": (1920, 1080), "4:5": (1080, 1350)}
 
 
+_FONTS_LOGGED: List[bool] = []
+
+
+def _log_fonts_dir(fonts_dir: Path) -> None:
+    """Один раз пишем в лог, откуда libass берёт шрифты.
+
+    Если папка пустая или недоступна, libass молча подставит системный шрифт —
+    текст станет шире и «мягче». По этой строке в app.log сразу видно причину.
+    """
+    if _FONTS_LOGGED:
+        return
+    _FONTS_LOGGED.append(True)
+    try:
+        count = len(list(Path(fonts_dir).glob("*.ttf")))
+    except OSError:
+        count = -1
+    marker = "OK" if count > 0 else "ПРОБЛЕМА: шрифты не найдены"
+    print(f"[render] шрифты libass: {fonts_dir} ({count} файлов) — {marker}",
+          file=sys.stderr, flush=True)
+
+
 def _esc(path: Path) -> str:
     # экранирование для аргумента фильтра ffmpeg
     p = str(path).replace("\\", "/")
@@ -438,8 +459,10 @@ def render_clip(source: Path, clip_start: float, clip_end: float, out_path: Path
             main_step = parts[0].rstrip()[:-len("[base]")] + "[_basem]"
             parts = [_pip.build_filters(pip_cam, pip_size, px, py, pip_mask, main_step, src)]
         if ass_path is not None:
+            fonts_dir = custom_fonts.libass_dir()
+            _log_fonts_dir(fonts_dir)
             parts.append(
-                f"[base]ass=filename='{_esc(ass_path)}':fontsdir='{_esc(custom_fonts.libass_dir())}':alpha=1,"
+                f"[base]ass=filename='{_esc(ass_path)}':fontsdir='{_esc(fonts_dir)}':alpha=1,"
                 f"format=yuv420p[v]"
             )
         else:

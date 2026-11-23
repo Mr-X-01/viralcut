@@ -6,7 +6,9 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from typing import Any, Dict, List, Optional
 
 from .config import DB_PATH
@@ -65,6 +67,23 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def session() -> Iterator[sqlite3.Connection]:
+    """Соединение с БД, которое закрывается на выходе.
+
+    `with connect() as conn` делает только commit/rollback и НЕ закрывает
+    соединение: каждый вызов API оставлял открытый handle до сборки мусора.
+    На Windows это держит файл БД заблокированным (WinError 32 при удалении
+    временной папки в тестах), на любой ОС — лишние дескрипторы.
+    """
+    conn = connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 # Точка входа миграций: первое изменение схемы не должно ломать базы
 # пользователей. Сейчас схема = версия 1, дальше добавляем шаги списком.
 SCHEMA_VERSION = 2
@@ -88,14 +107,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def init_db() -> None:
-    with connect() as conn:
+    with session() as conn:
         conn.executescript(SCHEMA)
         _migrate(conn)
 
 
 def count_projects() -> int:
     """Дешёвый счётчик для /api/health: без чтения и парсинга meta."""
-    with connect() as conn:
+    with session() as conn:
         row = conn.execute("SELECT COUNT(*) AS n FROM projects").fetchone()
     return int(row["n"] if row else 0)
 
@@ -105,7 +124,7 @@ def set_stage_if_active(pid: str, stage: str) -> None:
 
     Фоновый heartbeat не должен «оживлять» завершённый/упавший проект.
     """
-    with connect() as conn:
+    with session() as conn:
         conn.execute(
             "UPDATE projects SET stage=?, updated_at=? WHERE id=?"
             " AND status NOT IN ('done', 'error', 'cancelled')",
@@ -120,7 +139,7 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
 def create_project(url: str, options: Dict[str, Any], title: Optional[str] = None) -> Dict[str, Any]:
     pid = uuid.uuid4().hex[:12]
     now = time.time()
-    with connect() as conn:
+    with session() as conn:
         conn.execute(
             "INSERT INTO projects (id, url, title, status, stage, progress, created_at, updated_at, options)"
             " VALUES (?,?,?,?,?,?,?,?,?)",
@@ -130,7 +149,7 @@ def create_project(url: str, options: Dict[str, Any], title: Optional[str] = Non
 
 
 def get_project(pid: str) -> Optional[Dict[str, Any]]:
-    with connect() as conn:
+    with session() as conn:
         row = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
     if not row:
         return None
@@ -141,7 +160,7 @@ def get_project(pid: str) -> Optional[Dict[str, Any]]:
 
 
 def list_projects(limit: int = 50) -> List[Dict[str, Any]]:
-    with connect() as conn:
+    with session() as conn:
         rows = conn.execute(
             "SELECT id, url, title, status, stage, progress, created_at, duration, language, thumb, meta"
             " FROM projects ORDER BY created_at DESC LIMIT ?",
@@ -163,14 +182,14 @@ def update_project(pid: str, **fields: Any) -> None:
             fields[key] = json.dumps(fields[key], ensure_ascii=False)
     fields["updated_at"] = time.time()
     cols = ", ".join(f"{k}=?" for k in fields)
-    with connect() as conn:
+    with session() as conn:
         conn.execute(f"UPDATE projects SET {cols} WHERE id=?", (*fields.values(), pid))
 
 
 def merge_meta(pid: str, updates: Dict[str, Any], drop: tuple = ()) -> None:
     """Атомарно добавляет ключи в meta, не затирая чужие обновления."""
     with _META_LOCK:
-        with connect() as conn:
+        with session() as conn:
             row = conn.execute("SELECT meta FROM projects WHERE id=?", (pid,)).fetchone()
             if not row:
                 return
@@ -190,12 +209,12 @@ def set_recording_stage(pid: str, stage: str) -> None:
         " AND stage NOT LIKE 'Окно%' AND stage NOT LIKE 'Ошибка окна%'"
         " AND stage NOT LIKE 'Останавливаю%'))"
     )
-    with connect() as conn:
+    with session() as conn:
         conn.execute(sql, (stage, time.time(), pid))
 
 
 def delete_project(pid: str) -> None:
-    with connect() as conn:
+    with session() as conn:
         conn.execute("DELETE FROM clips WHERE project_id=?", (pid,))
         conn.execute("DELETE FROM projects WHERE id=?", (pid,))
 
@@ -204,7 +223,7 @@ def add_clip(project_id: str, idx: int, start: float, end: float, score: float,
              title: str, hook: str, caption: str, words: List[Dict[str, Any]],
              settings: Dict[str, Any], status: str = "rendering") -> Dict[str, Any]:
     cid = uuid.uuid4().hex[:12]
-    with connect() as conn:
+    with session() as conn:
         # повторный прогон того же проекта заменяет клип с этим номером
         conn.execute("DELETE FROM clips WHERE project_id=? AND idx=?", (project_id, idx))
         conn.execute(
@@ -218,7 +237,7 @@ def add_clip(project_id: str, idx: int, start: float, end: float, score: float,
 
 
 def get_clip(cid: str) -> Optional[Dict[str, Any]]:
-    with connect() as conn:
+    with session() as conn:
         row = conn.execute("SELECT * FROM clips WHERE id=?", (cid,)).fetchone()
     if not row:
         return None
@@ -236,12 +255,12 @@ def update_clip(cid: str, **fields: Any) -> None:
             fields[key] = json.dumps(fields[key], ensure_ascii=False)
     fields["updated_at"] = time.time()
     cols = ", ".join(f"{k}=?" for k in fields)
-    with connect() as conn:
+    with session() as conn:
         conn.execute(f"UPDATE clips SET {cols} WHERE id=?", (*fields.values(), cid))
 
 
 def list_clips(project_id: str) -> List[Dict[str, Any]]:
-    with connect() as conn:
+    with session() as conn:
         rows = conn.execute("SELECT * FROM clips WHERE project_id=? ORDER BY idx", (project_id,)).fetchall()
     clips = []
     for row in rows:
@@ -253,13 +272,13 @@ def list_clips(project_id: str) -> List[Dict[str, Any]]:
 
 
 def clear_clips(project_id: str) -> None:
-    with connect() as conn:
+    with session() as conn:
         conn.execute("DELETE FROM clips WHERE project_id=?", (project_id,))
 
 
 def reset_clips_pending(project_id: str) -> int:
     """Возвращает готовые клипы в очередь — при пересборке в HD."""
-    with connect() as conn:
+    with session() as conn:
         cur = conn.execute(
             "UPDATE clips SET status='pending', error=NULL, updated_at=? WHERE project_id=?",
             (time.time(), project_id))
@@ -268,7 +287,7 @@ def reset_clips_pending(project_id: str) -> int:
 
 def reset_stale_jobs() -> None:
     """Помечает задачи, прерванные остановкой сервера."""
-    with connect() as conn:
+    with session() as conn:
         conn.execute(
             "UPDATE projects SET status='done', stage='Запись стрима прервана перезапуском приложения'"
             " WHERE status IN ('queued','running','preparing') AND meta LIKE '%live%true%'"

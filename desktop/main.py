@@ -652,14 +652,13 @@ def _startup_selfcheck() -> None:
         emit(f"ffmpeg: ОШИБКА {exc}")
 
     emit(f"model: {os.environ.get('VIRALCUT_WHISPER_DIR') or 'скачается при первом запуске'}")
-    try:
-        from viralcut import system_stats
-
-        gpu = system_stats.gpu()
-        source = gpu.get("source") or ("ioreg" if IS_MACOS else "none")
-        emit(f"gpu: {gpu.get('name') or '?'} | {gpu.get('percent')}% | источник: {source}")
-    except Exception as exc:  # noqa: BLE001
-        emit(f"gpu: ОШИБКА {exc}")
+    if IS_WINDOWS:
+        # На Windows GPU читается через pdh.dll. Опрос откладываем до открытия
+        # окна: если системные счётчики ведут себя странно, приложение всё равно
+        # откроется, а не умрёт на старте.
+        emit("gpu: опрос отложен до открытия окна (Windows)")
+    else:
+        _log_gpu_probe(emit)
 
     if IS_WINDOWS:
         version = _webview2_version()
@@ -670,6 +669,18 @@ def _startup_selfcheck() -> None:
         emit(f"webview: {getattr(webview, '__version__', '?')}")
     except Exception as exc:  # noqa: BLE001
         emit(f"webview: НЕ ЗАГРУЖАЕТСЯ {exc}")
+
+
+def _log_gpu_probe(emit: Any) -> None:
+    """Однократный опрос GPU с записью в лог (не критичен для запуска)."""
+    try:
+        from viralcut import system_stats
+
+        gpu = system_stats.gpu()
+        source = gpu.get("source") or ("ioreg" if IS_MACOS else "none")
+        emit(f"gpu: {gpu.get('name') or '?'} | {gpu.get('percent')}% | источник: {source}")
+    except Exception as exc:  # noqa: BLE001
+        emit(f"gpu: ОШИБКА {exc}")
 
 
 def _startup_error_text(exc: Exception, data_dir: Path) -> str:
@@ -696,10 +707,16 @@ def main() -> None:
     # один экземпляр на папку данных
     lock = _acquire_instance_lock(data_dir)
     if lock is None:
+        # Раньше здесь был молчаливый return: с pythonw пользователь видел, что
+        # «ничего не открылось», и не понимал причину.
+        message = (f"{APP_NAME} уже запущен.\n\n"
+                   "Закройте окно приложения или завершите процесс ViralCut "
+                   "в диспетчере задач и запустите снова.")
         try:
-            print("ViralCut уже запущен — второй экземпляр не нужен", flush=True)
+            print(message, flush=True)
         except Exception:
             pass
+        _fatal_dialog(message)
         return
 
     log_path = _prepare_log(data_dir)
@@ -717,7 +734,17 @@ def main() -> None:
     print(f"platform: {sys.platform}", flush=True)
     print(f"frozen: {getattr(sys, 'frozen', False)}", flush=True)
     print(f"log: {log_path}", flush=True)
-    _startup_selfcheck()
+
+    def boot(stage: str) -> None:
+        """Метка этапа запуска: по логу видно, где именно приложение остановилось."""
+        print(f"[boot] {stage}", flush=True)
+
+    boot("самопроверка")
+    try:
+        _startup_selfcheck()
+    except Exception as exc:  # noqa: BLE001 — самопроверка не должна мешать запуску
+        print(f"[boot] самопроверка упала: {exc}", flush=True)
+    boot("environment готов")
 
     pot_proc = None
     server = None
@@ -742,9 +769,12 @@ def main() -> None:
             pot_proc = None
 
     try:
+        boot("распаковка Node/POT")
         vendor = vendor_dir(data_dir)
         seed_ejs_cache(data_dir, vendor)
+        boot("запуск POT-провайдера")
         pot_proc = start_pot_provider(data_dir, vendor, log)
+        boot("импорт сервера")
 
         import uvicorn
 
@@ -760,6 +790,7 @@ def main() -> None:
             lifespan="on",
         )
         server = uvicorn.Server(config)
+        boot(f"запуск сервера на порту {port}")
         thread = threading.Thread(target=server.run, name="viralcut-http", daemon=True)
         thread.start()
 
@@ -774,6 +805,7 @@ def main() -> None:
             while True:
                 time.sleep(1)
 
+        boot("создание окна")
         import webview
 
         window = webview.create_window(
@@ -792,6 +824,11 @@ def main() -> None:
         auto_close = os.environ.get("VIRALCUT_AUTOCLOSE")
         if auto_close:
             threading.Timer(float(auto_close), window.destroy).start()
+        boot("окно открыто")
+        if IS_WINDOWS:
+            def _probe_gpu() -> None:
+                _log_gpu_probe(lambda text: print(f"[selfcheck] {text}", flush=True))
+            threading.Thread(target=_probe_gpu, name="gpu-selfcheck", daemon=True).start()
         webview.start()
         shutdown()
         time.sleep(0.3)

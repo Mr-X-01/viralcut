@@ -127,7 +127,22 @@ cd /d "%~dp0"
 set "PYTHONNET_PYDLL=%CD%\python\python312.dll"
 set "PYTHONNET_RUNTIME=netfx"
 set "VIRALCUT_WHISPER_DIR=%CD%\models\whisper-small"
+set "VC_LOG=%APPDATA%\ViralCut\app.log"
+
+rem Запуск без консоли. Если окно не появилось — показываем ошибку в консоли,
+rem иначе пользователь видел «ничего не произошло» и не знал, что случилось.
 start "" "%CD%\python\pythonw.exe" "%CD%\desktop\main.py"
+timeout /t 4 /nobreak >nul
+tasklist /FI "IMAGENAME eq pythonw.exe" 2>nul | find /I "pythonw.exe" >nul
+if not errorlevel 1 exit /b 0
+
+echo.
+echo ViralCut не запустился. Ниже ошибка — её можно прислать разработчику.
+echo.
+"%CD%\python\python.exe" "%CD%\desktop\main.py"
+echo.
+if exist "%VC_LOG%" echo Лог: %VC_LOG%
+pause
 ''')
 
 write("ViralCut-console.bat", r'''@echo off
