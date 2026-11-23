@@ -2306,6 +2306,8 @@ function bindHud() {
   const head = $("#sysToggle");
   const card = $("#sysCard");
   if (!head || !card) return;
+  const phone = window.matchMedia("(max-width: 640px)").matches;
+  if (phone) card.classList.add("collapsed");
   try {
     if (localStorage.getItem("vcHudCollapsed") === "1") card.classList.add("collapsed");
   } catch (_) {}
@@ -2324,15 +2326,20 @@ function bindHud() {
   const saved = (() => {
     try { return JSON.parse(localStorage.getItem("vcHudPos") || "null"); } catch (_) { return null; }
   })();
-  if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+  if (!phone && saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
     const pos = placeHud(saved.x, saved.y);
     try { localStorage.setItem("vcHudPos", JSON.stringify({ x: pos.left, y: pos.top })); } catch (_) {}
   }
   window.addEventListener("resize", () => {
+    if (window.matchMedia("(max-width: 640px)").matches) {
+      for (const edge of ["left", "top", "right", "bottom"]) card.style.removeProperty(edge);
+      card.classList.add("collapsed");
+      return;
+    }
     const stored = (() => {
       try { return JSON.parse(localStorage.getItem("vcHudPos") || "null"); } catch (_) { return null; }
     })();
-    if (stored && Number.isFinite(stored.x)) placeHud(stored.x, stored.y);
+    if (stored && Number.isFinite(stored.x) && Number.isFinite(stored.y)) placeHud(stored.x, stored.y);
   });
 
   let drag = null;
@@ -2941,3 +2948,8 @@ async function openYoutubePublish(clipId) {
   });
   try{const jobs=await api('/api/youtube/uploads?clip_id='+encodeURIComponent(clipId));if(jobs.length)showJob(jobs[0]);}catch(_){}
 }
+
+// Shared modal scroll lock for phone browsers; all existing dialogs use #modal.
+new MutationObserver(() => {
+  document.documentElement.classList.toggle("has-modal", !$("#modal").classList.contains("hidden"));
+}).observe($("#modal"), {attributes:true, attributeFilter:["class"]});
