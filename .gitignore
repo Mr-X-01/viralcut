@@ -28,3 +28,6 @@ docs/promo/**/out*/
 docs/promo/**/slides*/
 docs/promo/**/*.mp4
 docs/promo/**/*.jpg
+
+# Browser-only launcher environment
+.venv-web/
